@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[workspace]
+
 [[bin]]
 name = "dalgona"
 path = "src/main.rs"
@@ -19,8 +21,8 @@ toml = "0.8"
 
 # HTTP
 reqwest = { version = "0.12", features = [
-  "json",
-  "rustls-tls",
+    "json",
+    "rustls-tls",
 ], default-features = false }
 
 # Error handling
@@ -37,6 +39,8 @@ clap = { version = "4", features = ["derive"] }
 # Solana
 solana-sdk = "2.2"
 solana-client = "2.2"
+spl-associated-token-account = "6"
+spl-token = "7"
 
 # Encoding
 bs58 = "0.5"
@@ -49,6 +53,10 @@ chrono = { version = "0.4", features = ["serde"] }
 # Utils
 dashmap = "6"
 rand = "0.9"
+ctrlc = "3"
+
+# Build OpenSSL from source for transitive crates that require it.
+openssl-sys = { version = "0.9", features = ["vendored"] }
 
 [profile.release]
 opt-level = 3

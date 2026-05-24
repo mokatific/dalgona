@@ -60,17 +60,10 @@ impl MomentumDetector {
     }
 
     pub fn push_price(&mut self, price: f64, timestamp_ms: i64) {
-        self.prices.push_back(PricePoint {
-            price,
-            timestamp_ms,
-        });
+        self.prices.push_back(PricePoint { price, timestamp_ms });
         while self.prices.len() > self.lookback_count * 2 {
             self.prices.pop_front();
         }
-    }
-
-    pub fn len(&self) -> usize {
-        self.prices.len()
     }
 
     pub fn analyze(&self) -> MomentumSnapshot {
@@ -86,6 +79,7 @@ impl MomentumDetector {
         }
 
         let lookback = self.lookback_count.min(self.prices.len());
+        // prices ordered newest-first
         let prices: Vec<&PricePoint> = self.prices.iter().rev().take(lookback).collect();
         let current_price = prices[0].price;
         let oldest_price = prices.last().unwrap().price;
@@ -109,16 +103,32 @@ impl MomentumDetector {
             }
         }
 
-        // Count consecutive moves in same direction
-        let mut consecutive = 0i32;
-        let mut last_dir: Option<bool> = None;
+        // Count consecutive moves in same direction (reset on direction change)
+        let mut max_consecutive: i32 = 0;
+        let mut current_run: i32 = 0;
         for i in 1..prices.len() {
             let up = prices[i - 1].price > prices[i].price;
-            match last_dir {
-                Some(d) if d == up => consecutive += if up { 1 } else { -1 },
-                _ => {}
+            let run_dir = if up { 1 } else { -1 };
+
+            if i == 1 {
+                current_run = run_dir;
+            } else {
+                let prev_up = prices[i - 2].price > prices[i - 1].price;
+                let prev_dir = if prev_up { 1 } else { -1 };
+                if run_dir == prev_dir {
+                    current_run += run_dir;
+                } else {
+                    // Direction changed — check if this run beats the max
+                    if current_run.abs() > max_consecutive.abs() {
+                        max_consecutive = current_run;
+                    }
+                    current_run = run_dir;
+                }
             }
-            last_dir = Some(up);
+        }
+        // Final check for last run
+        if current_run.abs() > max_consecutive.abs() {
+            max_consecutive = current_run;
         }
 
         let direction = if velocity_pct > self.threshold_pct * 0.3 {
@@ -132,7 +142,7 @@ impl MomentumDetector {
         let strength = compute_signal_strength(
             velocity_pct,
             self.threshold_pct,
-            consecutive,
+            max_consecutive,
             max_drawdown,
             lookback,
         );
@@ -203,71 +213,77 @@ impl MomentumDetector {
         trail_pct: f64,
         trail_act_pct: f64,
     ) -> Option<Signal> {
+        // PnL from entry
         let pnl_pct = if is_long {
             (current_price - entry_price) / entry_price * 100.0
         } else {
             (entry_price - current_price) / entry_price * 100.0
         };
 
-        let retracement = if is_long {
-            if peak_price > 0.0 {
-                (peak_price - current_price) / peak_price * 100.0
+        // Peak profit from entry (how far price moved in our favor at peak)
+        let peak_profit_pct = if entry_price > 0.0 {
+            if is_long {
+                (peak_price - entry_price) / entry_price * 100.0
             } else {
-                0.0
+                // For shorts, peak_price is the LOWEST price seen
+                (entry_price - peak_price) / entry_price * 100.0
             }
-        } else {
-            if peak_price > 0.0 {
-                (current_price - peak_price) / peak_price * 100.0
-            } else {
-                0.0
-            }
-        };
-
-        let peak_profit = if entry_price > 0.0 {
-            (peak_price - entry_price) / entry_price * 100.0
         } else {
             0.0
         };
 
+        // Retracement from peak
+        let retracement_pct = if peak_price > 0.0 && peak_profit_pct > 0.0 {
+            if is_long {
+                (peak_price - current_price) / peak_price * 100.0
+            } else {
+                (current_price - peak_price) / peak_price * 100.0
+            }
+        } else {
+            0.0
+        };
+
+        // Stop loss check (absolute loss from entry)
         if pnl_pct <= -sl_pct {
             warn!("STOP LOSS: pnl={:.2}%, threshold=-{:.2}%", pnl_pct, sl_pct);
             return Some(exit_signal(is_long, ExitReason::StopLoss));
         }
 
+        // Take profit check
         if pnl_pct >= tp_pct {
             info!("TAKE PROFIT: pnl={:.2}%, threshold={:.2}%", pnl_pct, tp_pct);
             return Some(exit_signal(is_long, ExitReason::TakeProfit));
         }
 
-        if peak_profit >= trail_act_pct && retracement >= trail_pct {
+        // Trailing stop: activated after peak_profit exceeds trail_act_pct
+        if peak_profit_pct >= trail_act_pct && retracement_pct >= trail_pct {
             warn!(
                 "TRAILING STOP: retracement={:.2}%, trail={:.2}%, peak_profit={:.2}%",
-                retracement, trail_pct, peak_profit
+                retracement_pct, trail_pct, peak_profit_pct
             );
             return Some(exit_signal(is_long, ExitReason::TrailingStop));
         }
 
+        // Time stop
         if hold_secs >= max_hold_secs {
             warn!("TIME STOP: held {}s, max={}s", hold_secs, max_hold_secs);
             return Some(exit_signal(is_long, ExitReason::TimeStop));
         }
 
+        // Momentum lost while in profit (hold > 2 min)
         if snapshot.direction == TradeDirection::Neutral && pnl_pct > 0.0 && hold_secs > 120 {
             debug!("Momentum lost, in profit — suggesting exit");
             return Some(exit_signal(is_long, ExitReason::MomentumLost));
         }
 
+        // Reversal detection
         if is_long && snapshot.direction == TradeDirection::Short && snapshot.strength > 40.0 {
             warn!("REVERSAL detected while long");
-            return Some(Signal::ExitLong {
-                reason: ExitReason::ReversalDetected,
-            });
+            return Some(Signal::ExitLong { reason: ExitReason::ReversalDetected });
         }
         if !is_long && snapshot.direction == TradeDirection::Long && snapshot.strength > 40.0 {
             warn!("REVERSAL detected while short");
-            return Some(Signal::ExitShort {
-                reason: ExitReason::ReversalDetected,
-            });
+            return Some(Signal::ExitShort { reason: ExitReason::ReversalDetected });
         }
 
         None

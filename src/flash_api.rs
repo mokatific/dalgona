@@ -249,15 +249,8 @@ impl FlashClient {
         trade_type: &str,
     ) -> Result<OpenPositionResponse> {
         self.open_position_inner(
-            input_token,
-            output_token,
-            amount_usd,
-            leverage,
-            trade_type,
-            None,
-            None,
-            None,
-            None,
+            input_token, output_token, amount_usd, leverage, trade_type,
+            None, None, None, None,
         )
         .await
     }
@@ -275,11 +268,7 @@ impl FlashClient {
         sl: Option<f64>,
     ) -> Result<OpenPositionResponse> {
         self.open_position_inner(
-            input_token,
-            output_token,
-            amount_usd,
-            leverage,
-            trade_type,
+            input_token, output_token, amount_usd, leverage, trade_type,
             Some(owner.to_string()),
             Some(slippage.to_string()),
             tp.map(|p| format!("{:.2}", p)),
@@ -379,5 +368,36 @@ impl FlashClient {
         let resp = self.client.get(&url).send().await?;
         let wrapper: PoolDataWrapper = resp.json().await?;
         Ok(wrapper.pools)
+    }
+
+    // --- Preview Endpoints ---
+
+    /// Preview exit fee for closing a position. Returns the fee amount in USD.
+    /// For paper trading we can use a fake position_key since we just want the fee estimate.
+    pub async fn preview_exit_fee(
+        &self,
+        position_key: &str,
+        close_usd: f64,
+    ) -> Result<f64> {
+        let url = format!("{}/preview/exit-fee", self.base_url);
+        let body = serde_json::json!({
+            "positionKey": position_key,
+            "closeAmountUsd": format!("{:.2}", close_usd),
+        });
+        debug!("POST {}", url);
+        let resp = self.client.post(&url).json(&body).send().await?;
+        let data: serde_json::Value = resp.json().await?;
+        // Response typically has a "fee" or "fees" field in USD
+        data.get("fee")
+            .or_else(|| data.get("fees"))
+            .and_then(|v| v.as_str().or_else(|| v.as_f64().map(|_| "ok")))
+            .and_then(|s| {
+                if let Some(f) = s.parse::<f64>().ok() { return Some(f); }
+                // might be nested
+                None
+            })
+            .or_else(|| data.get("fee").and_then(|v| v.as_f64()))
+            .or_else(|| data.get("fees").and_then(|v| v.as_f64()))
+            .ok_or_else(|| anyhow::anyhow!("could not parse exit fee from preview response: {:?}", data))
     }
 }

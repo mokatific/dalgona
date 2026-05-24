@@ -1,7 +1,7 @@
 use crate::config::RiskConfig;
-use chrono::{DateTime, Utc};
-use std::sync::Mutex;
+use chrono::{DateTime, Datelike, Utc};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use tracing::info;
 
 #[derive(Debug, Clone)]
@@ -41,10 +41,12 @@ impl Position {
     pub fn update_price(&mut self, price: f64) {
         self.current_price = price;
         if self.is_long {
+            // Longs: peak is the highest price seen
             if price > self.peak_price {
                 self.peak_price = price;
             }
         } else {
+            // Shorts: peak is the LOWEST price seen (best for shorts)
             if self.peak_price == 0.0 || price < self.peak_price {
                 self.peak_price = price;
             }
@@ -56,28 +58,48 @@ impl Position {
 pub struct RiskManager {
     config: RiskConfig,
     daily_pnl: Mutex<f64>,
+    total_fees: Mutex<f64>,
     daily_peak_balance: Mutex<f64>,
+    initial_balance: Mutex<f64>,
+    trade_date: Mutex<u32>,
     halted: AtomicBool,
     cooldown_until: Mutex<Option<DateTime<Utc>>>,
 }
 
 impl RiskManager {
     pub fn new(config: RiskConfig, initial_balance: f64) -> Self {
-        let peak = if initial_balance > 0.0 {
-            initial_balance
-        } else {
-            100_000.0
-        };
+        let peak = if initial_balance > 0.0 { initial_balance } else { 0.0 };
+        let today = Utc::now().day();
         Self {
             config,
             daily_pnl: Mutex::new(0.0),
+            total_fees: Mutex::new(0.0),
             daily_peak_balance: Mutex::new(peak),
+            initial_balance: Mutex::new(initial_balance),
+            trade_date: Mutex::new(today),
             halted: AtomicBool::new(false),
             cooldown_until: Mutex::new(None),
         }
     }
 
+    /// Check if the day has rolled over and reset daily counters if so.
+    fn maybe_reset_day(&self) {
+        let today = Utc::now().day();
+        let mut date_guard = self.trade_date.lock().unwrap();
+        if *date_guard != today {
+            info!("New day detected ({} -> {}), resetting daily PnL", *date_guard, today);
+            *date_guard = today;
+            *self.daily_pnl.lock().unwrap() = 0.0;
+            // Reset peak to current known balance
+            let balance = *self.initial_balance.lock().unwrap()
+                + *self.daily_pnl.lock().unwrap();
+            *self.daily_peak_balance.lock().unwrap() = balance;
+        }
+    }
+
     pub fn check_can_trade(&self, balance: f64) -> Result<(), String> {
+        self.maybe_reset_day();
+
         if self.halted.load(Ordering::Relaxed) {
             return Err("Trading HALTED — circuit breaker triggered".into());
         }
@@ -85,55 +107,76 @@ impl RiskManager {
         if let Ok(guard) = self.cooldown_until.lock() {
             if let Some(until) = *guard {
                 if Utc::now() < until {
-                    return Err(format!(
-                        "Cooldown active until {}",
-                        until.format("%H:%M:%S")
-                    ));
+                    return Err(format!("Cooldown active until {}", until.format("%H:%M:%S")));
                 }
             }
         }
 
-        let daily_loss = *self.daily_pnl.lock().unwrap();
-        if daily_loss.abs() >= self.config.max_daily_loss_usd {
+        let daily_pnl = *self.daily_pnl.lock().unwrap();
+        if daily_pnl.abs() >= self.config.max_daily_loss_usd && daily_pnl < 0.0 {
             self.halted.store(true, Ordering::Relaxed);
             return Err(format!(
                 "Daily loss limit reached: ${:.2} / ${:.2}",
-                daily_loss.abs(),
-                self.config.max_daily_loss_usd
+                daily_pnl.abs(), self.config.max_daily_loss_usd
             ));
         }
 
-        let drawdown = if balance > 0.0 {
+        if balance > 0.0 {
             let peak = *self.daily_peak_balance.lock().unwrap();
-            (peak - balance) / peak * 100.0
-        } else {
-            0.0
-        };
-        if drawdown >= self.config.max_drawdown_pct {
-            self.halted.store(true, Ordering::Relaxed);
-            return Err(format!(
-                "Max drawdown reached: {:.1}% / {:.1}%",
-                drawdown, self.config.max_drawdown_pct
-            ));
+            let effective_peak = if peak > 0.0 { peak } else { balance };
+            let drawdown = (effective_peak - balance) / effective_peak * 100.0;
+            if drawdown >= self.config.max_drawdown_pct {
+                self.halted.store(true, Ordering::Relaxed);
+                return Err(format!(
+                    "Max drawdown reached: {:.1}% / {:.1}%",
+                    drawdown, self.config.max_drawdown_pct
+                ));
+            }
         }
 
         Ok(())
     }
 
-    pub fn record_trade_result(&self, pnl: f64, balance: f64) {
-        let mut daily = self.daily_pnl.lock().unwrap();
-        let prev = *daily;
-        *daily = prev + pnl;
+    /// Validate position size against configured maximum.
+    pub fn check_position_size(&self, notional_usd: f64) -> Result<(), String> {
+        if notional_usd > self.config.max_position_notional_usd {
+            return Err(format!(
+                "Position size ${:.2} exceeds max ${:.2}",
+                notional_usd, self.config.max_position_notional_usd
+            ));
+        }
+        Ok(())
+    }
 
-        let mut peak = self.daily_peak_balance.lock().unwrap();
-        if balance > *peak {
-            *peak = balance;
+    pub fn record_trade_result(&self, pnl: f64, fees: f64, balance: f64) {
+        self.maybe_reset_day();
+
+        {
+            let mut daily = self.daily_pnl.lock().unwrap();
+            let prev = *daily;
+            *daily = prev + pnl;
+        }
+        {
+            let mut total_fees = self.total_fees.lock().unwrap();
+            *total_fees += fees;
         }
 
+        // Update peak balance
+        if balance > 0.0 {
+            let mut peak = self.daily_peak_balance.lock().unwrap();
+            if balance > *peak {
+                *peak = balance;
+            }
+            // Also update the tracked initial balance
+            let mut init = self.initial_balance.lock().unwrap();
+            *init = balance;
+        }
+
+        let daily_pnl = *self.daily_pnl.lock().unwrap();
         if pnl < 0.0 {
-            info!("Loss recorded: ${:.2}, daily PnL: ${:.2}", pnl, prev + pnl);
+            info!("Loss recorded: ${:.2}, daily PnL: ${:.2}", pnl, daily_pnl);
         } else {
-            info!("Win recorded: ${:.2}, daily PnL: ${:.2}", pnl, prev + pnl);
+            info!("Win recorded: ${:.2}, daily PnL: ${:.2}", pnl, daily_pnl);
         }
     }
 
@@ -145,6 +188,10 @@ impl RiskManager {
 
     pub fn is_halted(&self) -> bool {
         self.halted.load(Ordering::Relaxed)
+    }
+
+    pub fn total_fees(&self) -> f64 {
+        *self.total_fees.lock().unwrap()
     }
 }
 
@@ -178,14 +225,9 @@ impl TradeLog {
     pub fn record(&mut self, trade: TradeRecord) {
         let is_win = trade.pnl > 0.0;
         info!(
-            "TRADE CLOSED: {} {} @ ${:.2} -> ${:.2} | PnL: ${:.2} ({}) | hold: {}s",
-            trade.direction,
-            trade.symbol,
-            trade.entry_price,
-            trade.exit_price,
-            trade.pnl,
-            if is_win { "WIN" } else { "LOSS" },
-            trade.hold_secs
+            "TRADE CLOSED: {} {} @ ${:.2} -> ${:.2} | PnL: ${:.2} ({}) | fees: ${:.2} | hold: {}s",
+            trade.direction, trade.symbol, trade.entry_price, trade.exit_price,
+            trade.pnl, if is_win { "WIN" } else { "LOSS" }, trade.fees, trade.hold_secs
         );
         self.trades.push(trade);
         self.flush();
@@ -200,16 +242,8 @@ impl TradeLog {
         let total_pnl: f64 = self.trades.iter().map(|t| t.pnl).sum();
         let total_fees: f64 = self.trades.iter().map(|t| t.fees).sum();
         let avg_hold = self.trades.iter().map(|t| t.hold_secs as f64).sum::<f64>() / total as f64;
-        let best = self
-            .trades
-            .iter()
-            .map(|t| t.pnl)
-            .fold(f64::NEG_INFINITY, f64::max);
-        let worst = self
-            .trades
-            .iter()
-            .map(|t| t.pnl)
-            .fold(f64::INFINITY, f64::min);
+        let best = self.trades.iter().map(|t| t.pnl).fold(f64::NEG_INFINITY, f64::max);
+        let worst = self.trades.iter().map(|t| t.pnl).fold(f64::INFINITY, f64::min);
 
         TradeStats {
             total_trades: total,
@@ -224,9 +258,15 @@ impl TradeLog {
         }
     }
 
+    /// Atomic write: write to temp file then rename.
     fn flush(&self) {
         if let Ok(json) = serde_json::to_string_pretty(&self.trades) {
-            let _ = std::fs::write(&self.filepath, json);
+            let tmp_path = format!("{}.tmp", self.filepath);
+            if std::fs::write(&tmp_path, &json).is_ok() {
+                if std::fs::rename(&tmp_path, &self.filepath).is_err() {
+                    let _ = std::fs::write(&self.filepath, &json);
+                }
+            }
         }
     }
 }
