@@ -1,7 +1,7 @@
 use crate::config::RiskConfig;
 use chrono::{DateTime, Datelike, Utc};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::info;
 
 #[derive(Debug, Clone)]
@@ -68,7 +68,11 @@ pub struct RiskManager {
 
 impl RiskManager {
     pub fn new(config: RiskConfig, initial_balance: f64) -> Self {
-        let peak = if initial_balance > 0.0 { initial_balance } else { 0.0 };
+        let peak = if initial_balance > 0.0 {
+            initial_balance
+        } else {
+            0.0
+        };
         let today = Utc::now().day();
         Self {
             config,
@@ -87,12 +91,14 @@ impl RiskManager {
         let today = Utc::now().day();
         let mut date_guard = self.trade_date.lock().unwrap();
         if *date_guard != today {
-            info!("New day detected ({} -> {}), resetting daily PnL", *date_guard, today);
+            info!(
+                "New day detected ({} -> {}), resetting daily PnL",
+                *date_guard, today
+            );
             *date_guard = today;
             *self.daily_pnl.lock().unwrap() = 0.0;
             // Reset peak to current known balance
-            let balance = *self.initial_balance.lock().unwrap()
-                + *self.daily_pnl.lock().unwrap();
+            let balance = *self.initial_balance.lock().unwrap() + *self.daily_pnl.lock().unwrap();
             *self.daily_peak_balance.lock().unwrap() = balance;
         }
     }
@@ -107,7 +113,10 @@ impl RiskManager {
         if let Ok(guard) = self.cooldown_until.lock() {
             if let Some(until) = *guard {
                 if Utc::now() < until {
-                    return Err(format!("Cooldown active until {}", until.format("%H:%M:%S")));
+                    return Err(format!(
+                        "Cooldown active until {}",
+                        until.format("%H:%M:%S")
+                    ));
                 }
             }
         }
@@ -117,7 +126,8 @@ impl RiskManager {
             self.halted.store(true, Ordering::Relaxed);
             return Err(format!(
                 "Daily loss limit reached: ${:.2} / ${:.2}",
-                daily_pnl.abs(), self.config.max_daily_loss_usd
+                daily_pnl.abs(),
+                self.config.max_daily_loss_usd
             ));
         }
 
@@ -226,8 +236,14 @@ impl TradeLog {
         let is_win = trade.pnl > 0.0;
         info!(
             "TRADE CLOSED: {} {} @ ${:.2} -> ${:.2} | PnL: ${:.2} ({}) | fees: ${:.2} | hold: {}s",
-            trade.direction, trade.symbol, trade.entry_price, trade.exit_price,
-            trade.pnl, if is_win { "WIN" } else { "LOSS" }, trade.fees, trade.hold_secs
+            trade.direction,
+            trade.symbol,
+            trade.entry_price,
+            trade.exit_price,
+            trade.pnl,
+            if is_win { "WIN" } else { "LOSS" },
+            trade.fees,
+            trade.hold_secs
         );
         self.trades.push(trade);
         self.flush();
@@ -242,8 +258,16 @@ impl TradeLog {
         let total_pnl: f64 = self.trades.iter().map(|t| t.pnl).sum();
         let total_fees: f64 = self.trades.iter().map(|t| t.fees).sum();
         let avg_hold = self.trades.iter().map(|t| t.hold_secs as f64).sum::<f64>() / total as f64;
-        let best = self.trades.iter().map(|t| t.pnl).fold(f64::NEG_INFINITY, f64::max);
-        let worst = self.trades.iter().map(|t| t.pnl).fold(f64::INFINITY, f64::min);
+        let best = self
+            .trades
+            .iter()
+            .map(|t| t.pnl)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let worst = self
+            .trades
+            .iter()
+            .map(|t| t.pnl)
+            .fold(f64::INFINITY, f64::min);
 
         TradeStats {
             total_trades: total,

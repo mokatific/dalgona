@@ -4,7 +4,7 @@ use bincode;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
-    signature::{Keypair, Signer as SolanaSigner, Signature},
+    signature::{Keypair, Signature, Signer as SolanaSigner},
     transaction::Transaction,
 };
 use spl_associated_token_account::get_associated_token_address;
@@ -38,15 +38,13 @@ impl Executor {
             .with_context(|| format!("failed to read keypair from {}", expanded))?;
 
         let keypair: Keypair = if raw.trim_start().starts_with('[') {
-            let bytes: Vec<u8> = serde_json::from_str(&raw)
-                .context("keypair JSON parse failed")?;
-            Keypair::try_from(&bytes[..])
-                .context("failed to create keypair from bytes")?
+            let bytes: Vec<u8> = serde_json::from_str(&raw).context("keypair JSON parse failed")?;
+            Keypair::try_from(&bytes[..]).context("failed to create keypair from bytes")?
         } else {
-            let bytes = bs58::decode(raw.trim()).into_vec()
+            let bytes = bs58::decode(raw.trim())
+                .into_vec()
                 .context("failed to decode bs58 keypair")?;
-            Keypair::try_from(&bytes[..])
-                .context("failed to create keypair from bs58 bytes")?
+            Keypair::try_from(&bytes[..]).context("failed to create keypair from bs58 bytes")?
         };
 
         let rpc = Arc::new(RpcClient::new_with_commitment(
@@ -72,9 +70,8 @@ impl Executor {
     /// Get USDC (SPL token) balance in UI units (e.g. 100.5 USDC).
     /// Returns 0.0 if no token account exists.
     pub fn get_usdc_balance(&self) -> Result<f64> {
-        let usdc_mint: solana_sdk::pubkey::Pubkey = USDC_MINT
-            .parse()
-            .context("invalid USDC mint address")?;
+        let usdc_mint: solana_sdk::pubkey::Pubkey =
+            USDC_MINT.parse().context("invalid USDC mint address")?;
         let ata = get_associated_token_address(&self.keypair.pubkey(), &usdc_mint);
 
         match self.rpc.get_token_account_balance(&ata) {
@@ -101,17 +98,15 @@ impl Executor {
             .decode(tx_base64)
             .context("failed to decode base64 transaction")?;
 
-        let mut tx: Transaction = bincode::deserialize(&tx_bytes)
-            .context("failed to deserialize transaction")?;
+        let mut tx: Transaction =
+            bincode::deserialize(&tx_bytes).context("failed to deserialize transaction")?;
 
         // Fetch a fresh blockhash via spawn_blocking (RPC calls are synchronous)
         let rpc = self.rpc.clone();
-        let recent_blockhash = tokio::task::spawn_blocking(move || {
-            rpc.get_latest_blockhash()
-        })
-        .await
-        .context("spawn_blocking panicked")?
-        .context("failed to get latest blockhash")?;
+        let recent_blockhash = tokio::task::spawn_blocking(move || rpc.get_latest_blockhash())
+            .await
+            .context("spawn_blocking panicked")?
+            .context("failed to get latest blockhash")?;
 
         debug!("Signing with fresh blockhash: {}", recent_blockhash);
 
@@ -122,15 +117,16 @@ impl Executor {
         let sig: Result<Signature, anyhow::Error> = tokio::task::spawn_blocking(move || {
             let tx: Transaction = bincode::deserialize(&serialized)
                 .map_err(|e| anyhow::anyhow!("deserialize: {}", e))?;
-            let sig = rpc.send_transaction_with_config(
-                &tx,
-                solana_client::rpc_config::RpcSendTransactionConfig {
-                    skip_preflight: true,
-                    max_retries: Some(3),
-                    ..Default::default()
-                },
-            )
-            .map_err(|e| anyhow::anyhow!("send_transaction: {}", e))?;
+            let sig = rpc
+                .send_transaction_with_config(
+                    &tx,
+                    solana_client::rpc_config::RpcSendTransactionConfig {
+                        skip_preflight: true,
+                        max_retries: Some(3),
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| anyhow::anyhow!("send_transaction: {}", e))?;
             Ok(sig)
         })
         .await
@@ -166,7 +162,12 @@ impl Executor {
             match self.sign_and_send(tx_base64).await {
                 Ok(sig) => return Ok(sig),
                 Err(e) => {
-                    warn!("Attempt {}/{} failed: {:#}", attempt + 1, max_retries + 1, e);
+                    warn!(
+                        "Attempt {}/{} failed: {:#}",
+                        attempt + 1,
+                        max_retries + 1,
+                        e
+                    );
                     last_err = Some(e);
                     if attempt < max_retries {
                         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;

@@ -5,7 +5,7 @@ use crate::signal::{ExitReason, MomentumDetector, MomentumSnapshot, Signal};
 use chrono::Utc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
 /// Fallback taker fee rate if API preview fails
@@ -90,7 +90,10 @@ impl PaperEngine {
         info!("Leverage: {}x", self.config.flash.leverage);
         info!("Clip: ${:.0}", self.config.strategy.clip_size_usd);
         info!("Simulated balance: ${:.2}", self.sim_balance);
-        info!("Fee estimation: live API preview (entry + exit) + {}%/hr borrow", BORROW_FEE_HOURLY * 100.0);
+        info!(
+            "Fee estimation: live API preview (entry + exit) + {}%/hr borrow",
+            BORROW_FEE_HOURLY * 100.0
+        );
         warn!("PAPER MODE -- no real transactions will be signed");
 
         let initial_price = self.flash.get_price(&self.config.flash.market).await?;
@@ -123,15 +126,25 @@ impl PaperEngine {
             info!(
                 "Open paper position at shutdown: {} {} @ ${:.2} | uPnL: ${:.2} | accrued fees: ${:.4} (entry=${:.4} borrow=${:.4})",
                 if pos.inner.is_long { "LONG" } else { "SHORT" },
-                pos.inner.asset, pos.inner.current_price, pnl,
-                pos.total_fees(), pos.entry_fee, pos.accrued_borrow_fee
+                pos.inner.asset,
+                pos.inner.current_price,
+                pnl,
+                pos.total_fees(),
+                pos.entry_fee,
+                pos.accrued_borrow_fee
             );
         }
 
         let stats = self.trade_log.stats();
         info!("=== Paper Trading Final Stats ===");
-        info!("Trades: {} | Win rate: {:.1}%", stats.total_trades, stats.win_rate);
-        info!("Gross PnL: ${:.2} | Fees: ${:.2} | Net PnL: ${:.2}", stats.total_pnl, stats.total_fees, stats.net_pnl);
+        info!(
+            "Trades: {} | Win rate: {:.1}%",
+            stats.total_trades, stats.win_rate
+        );
+        info!(
+            "Gross PnL: ${:.2} | Fees: ${:.2} | Net PnL: ${:.2}",
+            stats.total_pnl, stats.total_fees, stats.net_pnl
+        );
         info!("Simulated balance: ${:.2}", self.sim_balance);
 
         Ok(())
@@ -146,8 +159,11 @@ impl PaperEngine {
 
         debug!(
             "[{}] prices={} velocity={:.4}% dir={:?} strength={:.0}",
-            market, snapshot.price_count, snapshot.price_velocity_pct,
-            snapshot.direction, snapshot.strength,
+            market,
+            snapshot.price_count,
+            snapshot.price_velocity_pct,
+            snapshot.direction,
+            snapshot.strength,
         );
 
         match &self.position {
@@ -180,7 +196,10 @@ impl PaperEngine {
         }
 
         if self.sim_balance < clip {
-            debug!("Insufficient simulated balance: ${:.2} < ${:.2}", self.sim_balance, clip);
+            debug!(
+                "Insufficient simulated balance: ${:.2} < ${:.2}",
+                self.sim_balance, clip
+            );
             return Ok(());
         }
 
@@ -189,11 +208,19 @@ impl PaperEngine {
         let signal = self.detector.detect_signal(snapshot);
 
         match signal {
-            Signal::MomentumLong { strength, velocity_pct } if bias != "short" => {
-                self.paper_open(true, clip, leverage, current_price, strength, velocity_pct).await?;
+            Signal::MomentumLong {
+                strength,
+                velocity_pct,
+            } if bias != "short" => {
+                self.paper_open(true, clip, leverage, current_price, strength, velocity_pct)
+                    .await?;
             }
-            Signal::MomentumShort { strength, velocity_pct } if bias != "long" => {
-                self.paper_open(false, clip, leverage, current_price, strength, velocity_pct).await?;
+            Signal::MomentumShort {
+                strength,
+                velocity_pct,
+            } if bias != "long" => {
+                self.paper_open(false, clip, leverage, current_price, strength, velocity_pct)
+                    .await?;
             }
             _ => {}
         }
@@ -213,19 +240,26 @@ impl PaperEngine {
         let trade_type = if is_long { "LONG" } else { "SHORT" };
 
         // Preview against live API to get REAL entry fee and price
-        let preview = self.flash.preview_open_position(
-            &self.config.flash.input_token,
-            &self.config.flash.market,
-            clip_usd,
-            leverage,
-            trade_type,
-        ).await?;
+        let preview = self
+            .flash
+            .preview_open_position(
+                &self.config.flash.input_token,
+                &self.config.flash.market,
+                clip_usd,
+                leverage,
+                trade_type,
+            )
+            .await?;
 
-        let entry_fee = preview.entry_fee.as_ref()
+        let entry_fee = preview
+            .entry_fee
+            .as_ref()
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(clip_usd * FALLBACK_FEE_RATE);
 
-        let entry_price = preview.new_entry_price.as_ref()
+        let entry_price = preview
+            .new_entry_price
+            .as_ref()
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(current_price);
 
@@ -233,14 +267,23 @@ impl PaperEngine {
         let notional = clip_usd * leverage;
 
         if let Some(ref err) = preview.err {
-            warn!("Preview returned error (proceeding with estimates): {}", err);
+            warn!(
+                "Preview returned error (proceeding with estimates): {}",
+                err
+            );
         }
 
         info!(
             ">>> [PAPER] OPENING {} ${:.0} x {:.0}x @ ${:.2} | liq=${} | entry_fee=${:.4} ({:.3}%) | strength={:.0} velocity={:.3}%",
-            trade_type, clip_usd, leverage, entry_price, liq_price,
-            entry_fee, (entry_fee / clip_usd) * 100.0,
-            strength, velocity_pct
+            trade_type,
+            clip_usd,
+            leverage,
+            entry_price,
+            liq_price,
+            entry_fee,
+            (entry_fee / clip_usd) * 100.0,
+            strength,
+            velocity_pct
         );
 
         self.position = Some(PaperPosition {
@@ -300,10 +343,12 @@ impl PaperEngine {
                 debug!(
                     "[PAPER] Holding {} {} @ ${:.2} | uPnL: ${:.2} ({:.2}%) | fees: ${:.4} (borrow: ${:.4}) | hold: {}s",
                     if pos.inner.is_long { "LONG" } else { "SHORT" },
-                    pos.inner.asset, current_price,
+                    pos.inner.asset,
+                    current_price,
                     pos.inner.unrealized_pnl_usd(),
                     pos.inner.unrealized_pnl_pct(),
-                    pos.total_fees(), pos.accrued_borrow_fee,
+                    pos.total_fees(),
+                    pos.accrued_borrow_fee,
                     pos.inner.hold_duration_secs()
                 );
             }
@@ -312,11 +357,7 @@ impl PaperEngine {
         Ok(())
     }
 
-    async fn paper_close(
-        &mut self,
-        exit_price: f64,
-        reason: ExitReason,
-    ) -> anyhow::Result<()> {
+    async fn paper_close(&mut self, exit_price: f64, reason: ExitReason) -> anyhow::Result<()> {
         let pos = match self.position.take() {
             Some(p) => p,
             None => return Ok(()),
@@ -325,10 +366,11 @@ impl PaperEngine {
         let gross_pnl = pos.inner.unrealized_pnl_usd();
 
         // Estimate exit fee from live API (with fallback)
-        let exit_fee = match self.flash.preview_exit_fee(
-            &pos.inner.position_key,
-            pos.inner.size_usd,
-        ).await {
+        let exit_fee = match self
+            .flash
+            .preview_exit_fee(&pos.inner.position_key, pos.inner.size_usd)
+            .await
+        {
             Ok(fee) => {
                 debug!("Exit fee from API: ${:.4}", fee);
                 fee
@@ -347,22 +389,36 @@ impl PaperEngine {
         info!(
             "<<< [PAPER] CLOSING {} {} | ${:.2} -> ${:.2} | reason={:?} | hold={:.1}min",
             if pos.inner.is_long { "LONG" } else { "SHORT" },
-            pos.inner.asset, pos.inner.entry_price, exit_price, reason, hold_mins
+            pos.inner.asset,
+            pos.inner.entry_price,
+            exit_price,
+            reason,
+            hold_mins
         );
         info!(
             "    gross_pnl=${:.2} | entry_fee=${:.4} exit_fee=${:.4} borrow_fee=${:.4} | total_fees=${:.4} ({:.3}%) | net=${:.2}",
-            gross_pnl, pos.entry_fee, exit_fee, pos.accrued_borrow_fee,
-            total_fees, (total_fees / pos.inner.size_usd) * 100.0, net_pnl
+            gross_pnl,
+            pos.entry_fee,
+            exit_fee,
+            pos.accrued_borrow_fee,
+            total_fees,
+            (total_fees / pos.inner.size_usd) * 100.0,
+            net_pnl
         );
 
         // Update simulated balance
         self.sim_balance += net_pnl;
 
-        self.risk.record_trade_result(net_pnl, total_fees, self.sim_balance);
+        self.risk
+            .record_trade_result(net_pnl, total_fees, self.sim_balance);
 
         self.trade_log.record(TradeRecord {
             symbol: pos.inner.symbol.clone(),
-            direction: if pos.inner.is_long { "LONG".into() } else { "SHORT".into() },
+            direction: if pos.inner.is_long {
+                "LONG".into()
+            } else {
+                "SHORT".into()
+            },
             entry_price: pos.inner.entry_price,
             exit_price,
             size_usd: pos.inner.size_usd,
@@ -374,7 +430,8 @@ impl PaperEngine {
         });
 
         if net_pnl < 0.0 {
-            self.risk.set_cooldown(self.config.strategy.cooldown_after_loss_secs);
+            self.risk
+                .set_cooldown(self.config.strategy.cooldown_after_loss_secs);
         }
 
         info!("[PAPER] Simulated balance: ${:.2}", self.sim_balance);

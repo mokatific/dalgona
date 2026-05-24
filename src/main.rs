@@ -124,25 +124,47 @@ async fn run_dry(config: config::Config) -> anyhow::Result<()> {
     let price = flash.get_price(market).await?;
     tracing::info!("{} price: ${:.2}", market, price);
 
-    tracing::info!("--- Dry Run: Previewing {} LONG ${:.0} @ {}x ---",
-        market, config.strategy.clip_size_usd, config.flash.leverage);
-    let preview = flash.preview_open_position(
-        &config.flash.input_token,
+    tracing::info!(
+        "--- Dry Run: Previewing {} LONG ${:.0} @ {}x ---",
         market,
         config.strategy.clip_size_usd,
-        config.flash.leverage,
-        "LONG",
-    ).await?;
+        config.flash.leverage
+    );
+    let preview = flash
+        .preview_open_position(
+            &config.flash.input_token,
+            market,
+            config.strategy.clip_size_usd,
+            config.flash.leverage,
+            "LONG",
+        )
+        .await?;
 
     if let Some(ref err) = preview.err {
         tracing::warn!("Preview error: {}", err);
     } else {
         tracing::info!("Preview result:");
-        tracing::info!("  Entry price: {}", preview.new_entry_price.as_deref().unwrap_or("N/A"));
-        tracing::info!("  Liquidation: {}", preview.new_liquidation_price.as_deref().unwrap_or("N/A"));
-        tracing::info!("  Entry fee: ${}", preview.entry_fee.as_deref().unwrap_or("N/A"));
-        tracing::info!("  Notional: ${}", preview.you_recieve_usd_ui.as_deref().unwrap_or("N/A"));
-        tracing::info!("  Output: {} {}", preview.output_amount_ui.as_deref().unwrap_or("N/A"), market);
+        tracing::info!(
+            "  Entry price: {}",
+            preview.new_entry_price.as_deref().unwrap_or("N/A")
+        );
+        tracing::info!(
+            "  Liquidation: {}",
+            preview.new_liquidation_price.as_deref().unwrap_or("N/A")
+        );
+        tracing::info!(
+            "  Entry fee: ${}",
+            preview.entry_fee.as_deref().unwrap_or("N/A")
+        );
+        tracing::info!(
+            "  Notional: ${}",
+            preview.you_recieve_usd_ui.as_deref().unwrap_or("N/A")
+        );
+        tracing::info!(
+            "  Output: {} {}",
+            preview.output_amount_ui.as_deref().unwrap_or("N/A"),
+            market
+        );
     }
 
     tracing::info!("--- Dry Run: Checking pool data ---");

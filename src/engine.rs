@@ -6,7 +6,7 @@ use crate::signal::{ExitReason, MomentumDetector, MomentumSnapshot, Signal};
 use chrono::Utc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
 pub struct ScalperEngine {
@@ -105,8 +105,14 @@ impl ScalperEngine {
 
         let stats = self.trade_log.stats();
         info!("=== Final Stats ===");
-        info!("Trades: {} | Win rate: {:.1}%", stats.total_trades, stats.win_rate);
-        info!("Net PnL: ${:.2} (fees: ${:.2})", stats.net_pnl, stats.total_fees);
+        info!(
+            "Trades: {} | Win rate: {:.1}%",
+            stats.total_trades, stats.win_rate
+        );
+        info!(
+            "Net PnL: ${:.2} (fees: ${:.2})",
+            stats.net_pnl, stats.total_fees
+        );
 
         Ok(())
     }
@@ -153,7 +159,10 @@ impl ScalperEngine {
             match self.find_position(&wallet, pos.is_long).await {
                 Ok(Some(_)) => true,
                 Ok(None) => {
-                    warn!("Position {} no longer exists on-chain (liquidated or closed externally)", pos.position_key);
+                    warn!(
+                        "Position {} no longer exists on-chain (liquidated or closed externally)",
+                        pos.position_key
+                    );
                     self.position = None;
                     false
                 }
@@ -179,8 +188,11 @@ impl ScalperEngine {
 
         debug!(
             "[{}] prices={} velocity={:.4}% dir={:?} strength={:.0}",
-            market, snapshot.price_count, snapshot.price_velocity_pct,
-            snapshot.direction, snapshot.strength,
+            market,
+            snapshot.price_count,
+            snapshot.price_velocity_pct,
+            snapshot.direction,
+            snapshot.strength,
         );
 
         match &self.position {
@@ -228,11 +240,19 @@ impl ScalperEngine {
         let signal = self.detector.detect_signal(snapshot);
 
         match signal {
-            Signal::MomentumLong { strength, velocity_pct } if bias != "short" => {
-                self.open_position(true, clip, leverage, current_price, strength, velocity_pct).await?;
+            Signal::MomentumLong {
+                strength,
+                velocity_pct,
+            } if bias != "short" => {
+                self.open_position(true, clip, leverage, current_price, strength, velocity_pct)
+                    .await?;
             }
-            Signal::MomentumShort { strength, velocity_pct } if bias != "long" => {
-                self.open_position(false, clip, leverage, current_price, strength, velocity_pct).await?;
+            Signal::MomentumShort {
+                strength,
+                velocity_pct,
+            } if bias != "long" => {
+                self.open_position(false, clip, leverage, current_price, strength, velocity_pct)
+                    .await?;
             }
             _ => {}
         }
@@ -256,13 +276,16 @@ impl ScalperEngine {
         );
 
         // Preview first
-        let preview = self.flash.preview_open_position(
-            &self.config.flash.input_token,
-            &self.config.flash.market,
-            clip_usd,
-            leverage,
-            trade_type,
-        ).await?;
+        let preview = self
+            .flash
+            .preview_open_position(
+                &self.config.flash.input_token,
+                &self.config.flash.market,
+                clip_usd,
+                leverage,
+                trade_type,
+            )
+            .await?;
 
         if let Some(ref err) = preview.err {
             warn!("Preview failed: {}", classify_api_error(err));
@@ -300,17 +323,20 @@ impl ScalperEngine {
             None
         };
 
-        let resp = self.flash.build_open_position(
-            &self.config.flash.input_token,
-            &self.config.flash.market,
-            clip_usd,
-            leverage,
-            trade_type,
-            &wallet,
-            &self.config.flash.slippage_pct,
-            tp_price,
-            sl_price,
-        ).await?;
+        let resp = self
+            .flash
+            .build_open_position(
+                &self.config.flash.input_token,
+                &self.config.flash.market,
+                clip_usd,
+                leverage,
+                trade_type,
+                &wallet,
+                &self.config.flash.slippage_pct,
+                tp_price,
+                sl_price,
+            )
+            .await?;
 
         if let Some(ref err) = resp.err {
             warn!("Build failed: {}", classify_api_error(err));
@@ -334,8 +360,10 @@ impl ScalperEngine {
                 sleep(Duration::from_secs(3)).await;
                 let wallet = self.executor.wallet_pubkey();
                 if let Some(flash_pos) = self.find_position(&wallet, is_long).await? {
-                    let entry = parse_f64_safe(&flash_pos.entry_price, "entry_price").unwrap_or(current_price);
-                    let size = parse_f64_safe(&flash_pos.size_usd, "size_usd").unwrap_or(clip_usd * leverage);
+                    let entry = parse_f64_safe(&flash_pos.entry_price, "entry_price")
+                        .unwrap_or(current_price);
+                    let size = parse_f64_safe(&flash_pos.size_usd, "size_usd")
+                        .unwrap_or(clip_usd * leverage);
                     let lev = parse_f64_safe(&flash_pos.leverage, "leverage").unwrap_or(leverage);
 
                     self.position = Some(Position {
@@ -396,7 +424,8 @@ impl ScalperEngine {
                 debug!(
                     "Holding {} {} @ ${:.2} | uPnL: {:.2}% | hold: {}s",
                     if pos.is_long { "LONG" } else { "SHORT" },
-                    pos.asset, current_price,
+                    pos.asset,
+                    current_price,
                     pos.unrealized_pnl_pct(),
                     pos.hold_duration_secs()
                 );
@@ -406,11 +435,7 @@ impl ScalperEngine {
         Ok(())
     }
 
-    async fn close_position(
-        &mut self,
-        exit_price: f64,
-        reason: ExitReason,
-    ) -> anyhow::Result<()> {
+    async fn close_position(&mut self, exit_price: f64, reason: ExitReason) -> anyhow::Result<()> {
         let pos = match self.position.take() {
             Some(p) => p,
             None => return Ok(()),
@@ -419,7 +444,9 @@ impl ScalperEngine {
         info!(
             "<<< CLOSING {} {} @ ${:.2} | reason={:?}",
             if pos.is_long { "LONG" } else { "SHORT" },
-            pos.asset, exit_price, reason
+            pos.asset,
+            exit_price,
+            reason
         );
 
         // Verify position still exists on-chain
@@ -435,7 +462,11 @@ impl ScalperEngine {
                 self.risk.record_trade_result(estimated_pnl, 0.0, 0.0);
                 self.trade_log.record(TradeRecord {
                     symbol: pos.symbol.clone(),
-                    direction: if pos.is_long { "LONG".into() } else { "SHORT".into() },
+                    direction: if pos.is_long {
+                        "LONG".into()
+                    } else {
+                        "SHORT".into()
+                    },
                     entry_price: pos.entry_price,
                     exit_price,
                     size_usd: pos.size_usd,
@@ -451,12 +482,15 @@ impl ScalperEngine {
 
         let close_usd = parse_f64_safe(&flash_pos.size_usd, "size_usd").unwrap_or(pos.size_usd);
 
-        let resp = self.flash.build_close_position(
-            &flash_pos.position_key,
-            close_usd,
-            &self.config.flash.input_token,
-            &self.config.flash.slippage_pct,
-        ).await?;
+        let resp = self
+            .flash
+            .build_close_position(
+                &flash_pos.position_key,
+                close_usd,
+                &self.config.flash.input_token,
+                &self.config.flash.slippage_pct,
+            )
+            .await?;
 
         if let Some(ref err) = resp.err {
             warn!("Close build failed: {}", classify_api_error(err));
@@ -476,23 +510,35 @@ impl ScalperEngine {
 
         match self.executor.sign_and_send_with_retry(&tx_b64, 2).await {
             Ok(sig) => {
-                let settled_pnl = resp.settled_pnl.as_ref()
+                let settled_pnl = resp
+                    .settled_pnl
+                    .as_ref()
                     .and_then(|s| s.parse::<f64>().ok())
                     .unwrap_or(pos.unrealized_pnl_usd());
-                let fees = resp.fees.as_ref()
+                let fees = resp
+                    .fees
+                    .as_ref()
                     .and_then(|s| s.parse::<f64>().ok())
                     .unwrap_or(0.0);
 
-                info!("Position closed: tx={} PnL=${:.2} fees=${:.2}", sig, settled_pnl, fees);
+                info!(
+                    "Position closed: tx={} PnL=${:.2} fees=${:.2}",
+                    sig, settled_pnl, fees
+                );
 
                 // Get updated balance for risk tracking
                 let updated_balance = self.executor.get_usdc_balance().unwrap_or(0.0);
-                self.risk.record_trade_result(settled_pnl, fees, updated_balance);
+                self.risk
+                    .record_trade_result(settled_pnl, fees, updated_balance);
 
                 let hold_secs = pos.hold_duration_secs();
                 self.trade_log.record(TradeRecord {
                     symbol: pos.symbol.clone(),
-                    direction: if pos.is_long { "LONG".into() } else { "SHORT".into() },
+                    direction: if pos.is_long {
+                        "LONG".into()
+                    } else {
+                        "SHORT".into()
+                    },
                     entry_price: pos.entry_price,
                     exit_price,
                     size_usd: pos.size_usd,
@@ -504,7 +550,8 @@ impl ScalperEngine {
                 });
 
                 if settled_pnl < 0.0 {
-                    self.risk.set_cooldown(self.config.strategy.cooldown_after_loss_secs);
+                    self.risk
+                        .set_cooldown(self.config.strategy.cooldown_after_loss_secs);
                 }
             }
             Err(e) => {
@@ -525,9 +572,9 @@ impl ScalperEngine {
     ) -> anyhow::Result<Option<FlashPosition>> {
         let side = if is_long { "Long" } else { "Short" };
         let positions = self.flash.get_positions(wallet).await?;
-        Ok(positions.into_iter().find(|p| {
-            p.asset == self.config.flash.market && p.side == side
-        }))
+        Ok(positions
+            .into_iter()
+            .find(|p| p.asset == self.config.flash.market && p.side == side))
     }
 }
 
@@ -537,7 +584,8 @@ fn now_ms() -> i64 {
 
 /// Parse a string to f64, returning an error with context instead of silently returning 0.
 fn parse_f64_safe(s: &str, field: &str) -> anyhow::Result<f64> {
-    s.parse::<f64>().map_err(|_| anyhow::anyhow!("failed to parse '{}' as f64 for field '{}'", s, field))
+    s.parse::<f64>()
+        .map_err(|_| anyhow::anyhow!("failed to parse '{}' as f64 for field '{}'", s, field))
 }
 
 /// Classify common Flash Trade API error strings for better logging.

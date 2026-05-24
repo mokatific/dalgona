@@ -60,7 +60,10 @@ impl MomentumDetector {
     }
 
     pub fn push_price(&mut self, price: f64, timestamp_ms: i64) {
-        self.prices.push_back(PricePoint { price, timestamp_ms });
+        self.prices.push_back(PricePoint {
+            price,
+            timestamp_ms,
+        });
         while self.prices.len() > self.lookback_count * 2 {
             self.prices.pop_front();
         }
@@ -279,11 +282,15 @@ impl MomentumDetector {
         // Reversal detection
         if is_long && snapshot.direction == TradeDirection::Short && snapshot.strength > 40.0 {
             warn!("REVERSAL detected while long");
-            return Some(Signal::ExitLong { reason: ExitReason::ReversalDetected });
+            return Some(Signal::ExitLong {
+                reason: ExitReason::ReversalDetected,
+            });
         }
         if !is_long && snapshot.direction == TradeDirection::Long && snapshot.strength > 40.0 {
             warn!("REVERSAL detected while short");
-            return Some(Signal::ExitShort { reason: ExitReason::ReversalDetected });
+            return Some(Signal::ExitShort {
+                reason: ExitReason::ReversalDetected,
+            });
         }
 
         None
