@@ -3,17 +3,18 @@
 //! Sources:
 //!   - flash:    fstats.io PnL + volume leaderboards (Flash Trade)
 //!   - jupiter:  Jupiter Perps leaderboard (API + browser fallback)
-//!   - hyperliquid: Curated seed list of known active traders
+//!   - hyperliquid: QuickNode HyperCore API for real wallet discovery + fill analysis
 //!   - all:      Merge all sources with deduplication
 //!
 //! Output: JSON array of wallet entries with address, source, rank, total_trades, scraped_at, etc.
+//! For hyperliquid source: data/wallets-hl.json with fill-level detail.
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use clap::Parser;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,9 +35,9 @@ struct Args {
     #[arg(short, long, value_enum)]
     source: SourceArg,
 
-    /// Output file path (JSON)
-    #[arg(short, long, default_value = "data/wallets.json")]
-    output: PathBuf,
+    /// Output file path (JSON). For hyperliquid source, defaults to data/wallets-hl.json
+    #[arg(short, long)]
+    output: Option<PathBuf>,
 
     /// Time window in days (used by fstats.io)
     #[arg(long, default_value_t = 30)]
@@ -49,6 +50,23 @@ struct Args {
     /// Maximum number of wallets in output (0 = unlimited)
     #[arg(long, default_value_t = 0)]
     max_wallets: usize,
+
+    /// QuickNode HyperCore endpoint URL for Hyperliquid data
+    /// Can also be set via QUICKNODE_HL_URL env var
+    #[arg(long)]
+    quicknode_url: Option<String>,
+
+    /// Use curated seed list instead of QuickNode discovery (for testing)
+    #[arg(long, default_value_t = false)]
+    use_seed: bool,
+
+    /// Number of HL markets to scan for wallet discovery (use 230 for all markets)
+    #[arg(long, default_value_t = 230)]
+    discover_markets: usize,
+
+    /// Batch size for QuickNode batch API calls (5 for free plan)
+    #[arg(long, default_value_t = 5)]
+    batch_size: usize,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -92,6 +110,95 @@ pub struct WalletEntry {
     pub markets_traded: Option<Vec<String>>,
     /// ISO 8601 timestamp when scraped
     pub scraped_at: String,
+}
+
+// ── Hyperliquid wallet output schema (data/wallets-hl.json) ──────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HlWalletOutput {
+    /// Wallet address (EVM 0x hex)
+    pub address: String,
+    /// Source platform
+    pub source: String,
+    /// Total number of fills
+    pub total_fills: u64,
+    /// Net PnL after fees in USD
+    pub net_pnl: f64,
+    /// ISO 8601 timestamp of last fill
+    pub last_active: String,
+    /// Fill records
+    pub fills: Vec<FillRecord>,
+    /// Account value from clearinghouse state (null if unavailable)
+    pub account_value: Option<f64>,
+    /// Total notional position size (null if unavailable)
+    pub total_ntl_pos: Option<f64>,
+    /// Markets traded
+    pub markets_traded: Vec<String>,
+    /// ISO 8601 timestamp when scraped
+    pub scraped_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FillRecord {
+    /// Market/coin (e.g. "BTC", "ETH")
+    pub coin: String,
+    /// Side: "B" (buy) or "A" (sell) or "O" (open)
+    pub side: String,
+    /// Price as string
+    pub px: String,
+    /// Size as string
+    pub sz: String,
+    /// Fee paid as string
+    pub fee: String,
+    /// Realized PnL for this fill as string
+    pub closed_pnl: String,
+    /// Timestamp in milliseconds
+    pub time: i64,
+    /// Direction: "Open Long", "Close Long", "Open Short", "Close Short"
+    pub dir: String,
+    /// Transaction hash
+    pub hash: String,
+}
+
+// ── QuickNode JSON-RPC types ─────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Deserialize)]
+#[allow(dead_code)]
+struct QnBatchResponse {
+    successful_states: Vec<(String, serde_json::Value)>,
+    failed_wallets: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct HlMeta {
+    universe: Vec<HlMarketInfo>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[allow(dead_code)]
+struct HlMarketInfo {
+    name: String,
+    #[serde(rename = "szDecimals")]
+    sz_decimals: u32,
+    #[serde(rename = "maxLeverage")]
+    max_leverage: u32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct HlTrade {
+    #[allow(dead_code)]
+    coin: String,
+    #[allow(dead_code)]
+    side: String,
+    #[allow(dead_code)]
+    px: String,
+    #[allow(dead_code)]
+    sz: String,
+    #[allow(dead_code)]
+    time: i64,
+    #[allow(dead_code)]
+    hash: String,
+    users: Vec<String>,
 }
 
 // ── Rate limiter ─────────────────────────────────────────────────────────────
@@ -519,13 +626,16 @@ async fn scrape_hyperliquid(
         if has_activity {
             info!(address = %entry.address, "Hyperliquid wallet validated with recent fills");
         } else {
-            debug!(address = %entry.address, "Could not verify Hyperliquid wallet activity, including as seed");
+            warn!(address = %entry.address, "Could not verify Hyperliquid wallet activity — seed data may be stale");
         }
 
         wallets.push(entry);
     }
 
-    info!(total = wallets.len(), "Hyperliquid scrape complete");
+    info!(
+        total = wallets.len(),
+        "Hyperliquid scrape complete (seed mode)"
+    );
     Ok(wallets)
 }
 
@@ -673,6 +783,467 @@ fn curated_hyperliquid_seed() -> Vec<WalletEntry> {
             scraped_at: String::new(),
         })
         .collect()
+}
+
+// ── QuickNode HyperCore wallet discovery ─────────────────────────────────────
+
+/// Resolve QuickNode URL from CLI flag, env var, or default.
+fn resolve_quicknode_url(cli_url: &Option<String>) -> Option<String> {
+    cli_url
+        .as_ref()
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .or_else(|| std::env::var("QUICKNODE_HL_URL").ok())
+        .filter(|s| !s.is_empty())
+}
+
+/// Fetch all available market names from Hyperliquid Info API.
+async fn get_all_markets(client: &Client, rate_limiter: &RateLimiter) -> Result<Vec<String>> {
+    rate_limiter.throttle(HL_HOST).await;
+
+    let resp = client
+        .post(HL_API)
+        .header("Content-Type", "application/json")
+        .body(r#"{"type":"meta"}"#)
+        .send()
+        .await
+        .context("Failed to fetch HL market metadata")?;
+
+    let text = resp
+        .text()
+        .await
+        .context("Failed to read HL meta response")?;
+    let meta: HlMeta = serde_json::from_str(&text).context("Failed to parse HL meta response")?;
+
+    let markets: Vec<String> = meta.universe.into_iter().map(|m| m.name).collect();
+    info!(count = markets.len(), "Fetched HL market list");
+    Ok(markets)
+}
+
+/// Discover candidate wallet addresses from recent trades across multiple markets.
+async fn discover_wallets_from_trades(
+    client: &Client,
+    rate_limiter: &RateLimiter,
+    markets: &[String],
+    max_markets: usize,
+) -> Result<HashSet<String>> {
+    let mut all_addresses: HashSet<String> = HashSet::new();
+    let scan_count = max_markets.min(markets.len());
+
+    info!(
+        total_markets = markets.len(),
+        scanning = scan_count,
+        "Starting wallet discovery from recent trades"
+    );
+
+    for market in markets.iter().take(scan_count) {
+        rate_limiter.throttle(HL_HOST).await;
+
+        let body = serde_json::json!({
+            "type": "recentTrades",
+            "coin": market
+        })
+        .to_string();
+
+        match client
+            .post(HL_API)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    match resp.text().await {
+                        Ok(text) => match serde_json::from_str::<Vec<HlTrade>>(&text) {
+                            Ok(trades) => {
+                                for trade in &trades {
+                                    for user in &trade.users {
+                                        all_addresses.insert(user.clone());
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!(market, error = %e, "Failed to parse trades");
+                            }
+                        },
+                        Err(e) => {
+                            debug!(market, error = %e, "Failed to read trades response");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                debug!(market, error = %e, "Failed to fetch trades");
+            }
+        }
+    }
+
+    info!(
+        unique_addresses = all_addresses.len(),
+        markets_scanned = scan_count,
+        "Wallet discovery from trades complete"
+    );
+    Ok(all_addresses)
+}
+
+/// Batch validate wallet addresses using QuickNode HyperCore API.
+/// Returns addresses that have non-zero account values (active traders with positions).
+async fn batch_validate_wallets(
+    client: &Client,
+    quicknode_url: &str,
+    addresses: &[String],
+    batch_size: usize,
+) -> Result<Vec<(String, Option<f64>, Option<f64>)>> {
+    let mut validated: Vec<(String, Option<f64>, Option<f64>)> = Vec::new();
+
+    for chunk in addresses.chunks(batch_size) {
+        let request_body = serde_json::json!({
+            "method": "hl_batchClearinghouseStates",
+            "params": {
+                "users": chunk,
+                "dex": "ALL_DEXES"
+            },
+            "id": 1,
+            "jsonrpc": "2.0"
+        });
+
+        let resp = client
+            .post(quicknode_url)
+            .header("Content-Type", "application/json")
+            .body(request_body.to_string())
+            .send()
+            .await
+            .context("QuickNode batchClearinghouseStates request failed")?;
+
+        let text = resp
+            .text()
+            .await
+            .context("Failed to read QuickNode response")?;
+
+        // Parse as generic JSON to handle both success and error responses
+        let json: serde_json::Value =
+            serde_json::from_str(&text).context("Failed to parse QuickNode response")?;
+
+        if let Some(error) = json.get("error") {
+            let msg = error
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            anyhow::bail!("QuickNode API error: {}", msg);
+        }
+
+        let result = json
+            .get("result")
+            .context("QuickNode response missing 'result' field")?;
+
+        // Parse successful_states array: [[address, state], ...]
+        if let Some(states) = result.get("successful_states").and_then(|v| v.as_array()) {
+            for entry in states {
+                if let Some(arr) = entry.as_array()
+                    && arr.len() >= 2
+                {
+                    let addr = arr[0].as_str().unwrap_or("").to_string();
+                    let state = &arr[1];
+
+                    let account_value = state
+                        .get("marginSummary")
+                        .and_then(|m| m.get("accountValue"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<f64>().ok());
+
+                    let total_ntl_pos = state
+                        .get("marginSummary")
+                        .and_then(|m| m.get("totalNtlPos"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<f64>().ok());
+
+                    validated.push((addr, account_value, total_ntl_pos));
+                }
+            }
+        }
+
+        if let Some(failed) = result.get("failed_wallets").and_then(|v| v.as_array())
+            && !failed.is_empty()
+        {
+            debug!(
+                count = failed.len(),
+                "Some wallets failed in batch validation"
+            );
+        }
+
+        info!(
+            batch_size = chunk.len(),
+            validated_so_far = validated.len(),
+            "Batch validation progress"
+        );
+
+        // Small delay between batches to avoid rate limiting
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    info!(total = validated.len(), "Batch validation complete");
+    Ok(validated)
+}
+
+/// Fetch fill data for a single wallet from Hyperliquid Info API.
+async fn fetch_wallet_fills(
+    client: &Client,
+    rate_limiter: &RateLimiter,
+    address: &str,
+) -> Result<Vec<FillRecord>> {
+    // Use userFillsByTime for the last 30 days
+    let thirty_days_ago_ms = Utc::now()
+        .checked_sub_signed(chrono::Duration::days(30))
+        .unwrap_or_else(Utc::now)
+        .timestamp_millis();
+
+    let body = serde_json::json!({
+        "type": "userFillsByTime",
+        "user": address,
+        "startTime": thirty_days_ago_ms.max(0)
+    });
+
+    rate_limiter.throttle(HL_HOST).await;
+
+    let resp = client
+        .post(HL_API)
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .context("userFillsByTime request failed")?;
+
+    let text = resp
+        .text()
+        .await
+        .context("Failed to read userFillsByTime response")?;
+
+    let raw_fills: Vec<serde_json::Value> =
+        serde_json::from_str(&text).context("Failed to parse userFillsByTime response")?;
+
+    let fills: Vec<FillRecord> = raw_fills
+        .into_iter()
+        .map(|f| FillRecord {
+            coin: f
+                .get("coin")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            side: f
+                .get("side")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            px: f
+                .get("px")
+                .and_then(|v| v.as_str())
+                .unwrap_or("0")
+                .to_string(),
+            sz: f
+                .get("sz")
+                .and_then(|v| v.as_str())
+                .unwrap_or("0")
+                .to_string(),
+            fee: f
+                .get("fee")
+                .and_then(|v| v.as_str())
+                .unwrap_or("0")
+                .to_string(),
+            closed_pnl: f
+                .get("closedPnl")
+                .and_then(|v| v.as_str())
+                .unwrap_or("0")
+                .to_string(),
+            time: f.get("time").and_then(|v| v.as_i64()).unwrap_or(0),
+            dir: f
+                .get("dir")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            hash: f
+                .get("hash")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        })
+        .collect();
+
+    Ok(fills)
+}
+
+/// Apply wallet filters: >50 fills, positive net PnL, active in last 30 days.
+fn apply_wallet_filters(wallets: &mut Vec<HlWalletOutput>, min_fills: u64, active_days: i64) {
+    let cutoff_ms = Utc::now()
+        .checked_sub_signed(chrono::Duration::days(active_days))
+        .unwrap_or_else(Utc::now)
+        .timestamp_millis();
+
+    wallets.retain(|w| {
+        // Filter 1: minimum fills
+        if w.total_fills < min_fills {
+            debug!(address = %w.address, fills = w.total_fills, "Filtered: insufficient fills");
+            return false;
+        }
+        // Filter 2: positive net PnL
+        if w.net_pnl <= 0.0 {
+            debug!(address = %w.address, pnl = w.net_pnl, "Filtered: non-positive PnL");
+            return false;
+        }
+        // Filter 3: active within cutoff
+        if let Ok(last_time) = chrono::DateTime::parse_from_rfc3339(&w.last_active)
+            && last_time.timestamp_millis() < cutoff_ms
+        {
+            debug!(address = %w.address, last_active = %w.last_active, "Filtered: not recently active");
+            return false;
+        }
+        true
+    });
+}
+
+/// Main QuickNode wallet discovery pipeline.
+async fn scrape_hyperliquid_quicknode(
+    client: &Client,
+    rate_limiter: &RateLimiter,
+    quicknode_url: &str,
+    discover_markets: usize,
+    batch_size: usize,
+    max_wallets: usize,
+    output: &PathBuf,
+) -> Result<Vec<HlWalletOutput>> {
+    let now = Utc::now().to_rfc3339();
+
+    // Step 1: Get all market names
+    let markets = get_all_markets(client, rate_limiter).await?;
+    if markets.is_empty() {
+        anyhow::bail!("No markets found on Hyperliquid — API may be down");
+    }
+
+    // Step 2: Discover candidate wallet addresses from recent trades
+    let candidate_addresses =
+        discover_wallets_from_trades(client, rate_limiter, &markets, discover_markets).await?;
+
+    if candidate_addresses.is_empty() {
+        anyhow::bail!("No candidate addresses discovered from recent trades");
+    }
+    info!(
+        candidates = candidate_addresses.len(),
+        "Discovered candidate wallets from trades"
+    );
+
+    // Step 3: Batch validate wallets via QuickNode
+    let address_list: Vec<String> = candidate_addresses.into_iter().collect();
+    let validated =
+        batch_validate_wallets(client, quicknode_url, &address_list, batch_size).await?;
+
+    // Step 4: Fetch fills for each validated wallet and build output
+    let mut hl_wallets: Vec<HlWalletOutput> = Vec::new();
+    let validated_count = validated.len();
+
+    for (i, (address, account_value, total_ntl_pos)) in validated.iter().enumerate() {
+        if i % 20 == 0 {
+            info!(
+                progress = i,
+                total = validated_count,
+                "Fetching fills for validated wallets"
+            );
+        }
+
+        match fetch_wallet_fills(client, rate_limiter, address).await {
+            Ok(fills) => {
+                if fills.is_empty() {
+                    continue;
+                }
+
+                // Compute aggregates from fills
+                let total_fills = fills.len() as u64;
+                let net_pnl: f64 = fills
+                    .iter()
+                    .map(|f| f.closed_pnl.parse::<f64>().unwrap_or(0.0))
+                    .sum();
+                let last_fill_time_ms = fills.iter().map(|f| f.time).max().unwrap_or(0);
+                let last_active = if last_fill_time_ms > 0 {
+                    Utc.timestamp_millis_opt(last_fill_time_ms)
+                        .single()
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+
+                let markets_traded: Vec<String> = fills
+                    .iter()
+                    .map(|f| f.coin.clone())
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect();
+
+                hl_wallets.push(HlWalletOutput {
+                    address: address.clone(),
+                    source: "hyperliquid".to_string(),
+                    total_fills,
+                    net_pnl,
+                    last_active,
+                    fills,
+                    account_value: *account_value,
+                    total_ntl_pos: *total_ntl_pos,
+                    markets_traded,
+                    scraped_at: now.clone(),
+                });
+            }
+            Err(e) => {
+                debug!(address = %address, error = %e, "Failed to fetch fills, skipping");
+            }
+        }
+    }
+
+    info!(pre_filter = hl_wallets.len(), "Wallets with fills fetched");
+
+    // Step 5: Apply filters (>50 fills, positive PnL, active <30 days)
+    apply_wallet_filters(&mut hl_wallets, 50, 30);
+    info!(post_filter = hl_wallets.len(), "Wallets after filtering");
+
+    // Sort by net_pnl descending
+    hl_wallets.sort_by(|a, b| {
+        b.net_pnl
+            .partial_cmp(&a.net_pnl)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Apply max_wallets limit
+    if max_wallets > 0 && hl_wallets.len() > max_wallets {
+        hl_wallets.truncate(max_wallets);
+    }
+
+    // Step 6: Write output
+    atomic_write_hl_json(output, &hl_wallets)?;
+    info!(path = %output.display(), count = hl_wallets.len(), "Wrote HL wallet output");
+
+    Ok(hl_wallets)
+}
+
+/// Atomic write for HL wallet output.
+fn atomic_write_hl_json(path: &PathBuf, data: &[HlWalletOutput]) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent)
+            .context(format!("Failed to create directory: {}", parent.display()))?;
+    }
+
+    let tmp_path = path.with_extension("json.tmp");
+    let json = serde_json::to_string_pretty(data).context("Failed to serialize HL wallet data")?;
+
+    fs::write(&tmp_path, &json)
+        .context(format!("Failed to write temp file: {}", tmp_path.display()))?;
+
+    fs::rename(&tmp_path, path).context(format!(
+        "Failed to rename {} -> {}",
+        tmp_path.display(),
+        path.display()
+    ))?;
+
+    Ok(())
 }
 
 // ── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -836,7 +1407,29 @@ async fn main() -> Result<()> {
         .init();
 
     info!("=== scrape-leaderboards ===");
-    info!(source = %args.source, output = %args.output.display(), days = args.days, rate_limit = args.rate_limit, max_wallets = args.max_wallets);
+
+    // Determine output path
+    let output = args.output.clone().unwrap_or_else(|| {
+        if matches!(args.source, SourceArg::Hyperliquid) {
+            PathBuf::from("data/wallets-hl.json")
+        } else {
+            PathBuf::from("data/wallets.json")
+        }
+    });
+
+    info!(source = %args.source, output = %output.display(), days = args.days, rate_limit = args.rate_limit, max_wallets = args.max_wallets);
+
+    // Check QuickNode URL for hyperliquid source
+    let quicknode_url = resolve_quicknode_url(&args.quicknode_url);
+    if matches!(args.source, SourceArg::Hyperliquid | SourceArg::All)
+        && !args.use_seed
+        && quicknode_url.is_none()
+    {
+        anyhow::bail!(
+            "QuickNode URL required for Hyperliquid wallet discovery. \
+             Set --quicknode-url flag or QUICKNODE_HL_URL env var, or use --use-seed for testing."
+        );
+    }
 
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
@@ -844,6 +1437,40 @@ async fn main() -> Result<()> {
         .context("Failed to create HTTP client")?;
 
     let rate_limiter = RateLimiter::new(args.rate_limit);
+
+    // For hyperliquid-only with QuickNode, use the dedicated pipeline
+    if matches!(args.source, SourceArg::Hyperliquid) && !args.use_seed {
+        let qn_url = quicknode_url.as_ref().context("QuickNode URL required")?;
+        let hl_output_path = output.clone();
+        let result = scrape_hyperliquid_quicknode(
+            &client,
+            &rate_limiter,
+            qn_url,
+            args.discover_markets,
+            args.batch_size,
+            args.max_wallets,
+            &hl_output_path,
+        )
+        .await;
+
+        match result {
+            Ok(wallets) => {
+                info!(
+                    count = wallets.len(),
+                    path = %hl_output_path.display(),
+                    "QuickNode HL wallet discovery complete"
+                );
+                if wallets.is_empty() {
+                    anyhow::bail!("No qualifying wallets found after filtering");
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "QuickNode HL wallet discovery failed");
+                return Err(e);
+            }
+        }
+        return Ok(());
+    }
 
     let mut all_wallets: Vec<WalletEntry> = Vec::new();
 
@@ -857,7 +1484,6 @@ async fn main() -> Result<()> {
                 Err(e) => {
                     error!(error = %e, "Flash Trade scrape failed");
                     if matches!(args.source, SourceArg::Flash) {
-                        // If this was the only source, still continue to write empty output
                         warn!("Writing empty output due to flash scrape failure");
                     }
                 }
@@ -885,7 +1511,10 @@ async fn main() -> Result<()> {
         SourceArg::Hyperliquid | SourceArg::All => {
             match scrape_hyperliquid(&client, &rate_limiter).await {
                 Ok(wallets) => {
-                    info!(count = wallets.len(), "Hyperliquid: scraped wallets");
+                    info!(
+                        count = wallets.len(),
+                        "Hyperliquid: scraped wallets (seed mode)"
+                    );
                     all_wallets.extend(wallets);
                 }
                 Err(e) => {
@@ -911,9 +1540,9 @@ async fn main() -> Result<()> {
     }
 
     // Write output
-    atomic_write_json(&args.output, &all_wallets)?;
+    atomic_write_json(&output, &all_wallets)?;
     info!(
-        path = %args.output.display(),
+        path = %output.display(),
         count = all_wallets.len(),
         "Output written successfully"
     );
@@ -1138,6 +1767,513 @@ mod tests {
         assert_eq!(format!("{}", SourceArg::Jupiter), "jupiter");
         assert_eq!(format!("{}", SourceArg::Hyperliquid), "hyperliquid");
         assert_eq!(format!("{}", SourceArg::All), "all");
+    }
+
+    // ── QuickNode integration tests ────────────────────────────────────────
+
+    #[test]
+    fn test_hl_wallet_output_schema() {
+        let now = Utc::now().to_rfc3339();
+        let entry = HlWalletOutput {
+            address: "0xabcdef1234567890abcdef1234567890abcdef12".to_string(),
+            source: "hyperliquid".to_string(),
+            total_fills: 150,
+            net_pnl: 5000.50,
+            last_active: "2026-05-20T12:00:00Z".to_string(),
+            fills: vec![FillRecord {
+                coin: "BTC".to_string(),
+                side: "B".to_string(),
+                px: "77000.0".to_string(),
+                sz: "0.001".to_string(),
+                fee: "0.10".to_string(),
+                closed_pnl: "50.0".to_string(),
+                time: 1779368586925,
+                dir: "Open Long".to_string(),
+                hash: "0xabc123".to_string(),
+            }],
+            account_value: Some(100000.0),
+            total_ntl_pos: Some(50000.0),
+            markets_traded: vec!["BTC".to_string(), "ETH".to_string()],
+            scraped_at: now,
+        };
+
+        let json = serde_json::to_value(&entry).unwrap();
+        // Verify all required fields from VAL-WALLET-004
+        assert!(json.get("address").is_some(), "Missing address field");
+        assert!(
+            json.get("total_fills").is_some(),
+            "Missing total_fills field"
+        );
+        assert!(json.get("net_pnl").is_some(), "Missing net_pnl field");
+        assert!(
+            json.get("last_active").is_some(),
+            "Missing last_active field"
+        );
+        assert!(json.get("fills").is_some(), "Missing fills field");
+        assert!(json.get("source").is_some(), "Missing source field");
+        assert!(
+            json.get("account_value").is_some(),
+            "Missing account_value field"
+        );
+        assert!(
+            json.get("markets_traded").is_some(),
+            "Missing markets_traded field"
+        );
+
+        // Verify fill record fields
+        let fills = json.get("fills").unwrap().as_array().unwrap();
+        assert_eq!(fills.len(), 1);
+        let fill = &fills[0];
+        assert!(fill.get("coin").is_some(), "Fill missing coin");
+        assert!(fill.get("side").is_some(), "Fill missing side");
+        assert!(fill.get("px").is_some(), "Fill missing px");
+        assert!(fill.get("sz").is_some(), "Fill missing sz");
+        assert!(fill.get("fee").is_some(), "Fill missing fee");
+        assert!(fill.get("time").is_some(), "Fill missing time");
+        assert!(fill.get("dir").is_some(), "Fill missing dir");
+        assert!(fill.get("hash").is_some(), "Fill missing hash");
+        assert!(fill.get("closed_pnl").is_some(), "Fill missing closed_pnl");
+    }
+
+    #[test]
+    fn test_wallet_filter_min_fills() {
+        let now = Utc::now().to_rfc3339();
+        let mut wallets = vec![
+            HlWalletOutput {
+                address: "0xaaa".to_string(),
+                source: "hyperliquid".to_string(),
+                total_fills: 100,
+                net_pnl: 5000.0,
+                last_active: now.clone(),
+                fills: vec![],
+                account_value: Some(10000.0),
+                total_ntl_pos: Some(5000.0),
+                markets_traded: vec!["BTC".to_string()],
+                scraped_at: now.clone(),
+            },
+            HlWalletOutput {
+                address: "0xbbb".to_string(),
+                source: "hyperliquid".to_string(),
+                total_fills: 30, // Below 50 minimum
+                net_pnl: 1000.0,
+                last_active: now.clone(),
+                fills: vec![],
+                account_value: Some(5000.0),
+                total_ntl_pos: None,
+                markets_traded: vec!["ETH".to_string()],
+                scraped_at: now.clone(),
+            },
+            HlWalletOutput {
+                address: "0xccc".to_string(),
+                source: "hyperliquid".to_string(),
+                total_fills: 200,
+                net_pnl: 10000.0,
+                last_active: now.clone(),
+                fills: vec![],
+                account_value: Some(50000.0),
+                total_ntl_pos: Some(20000.0),
+                markets_traded: vec!["SOL".to_string()],
+                scraped_at: now,
+            },
+        ];
+
+        apply_wallet_filters(&mut wallets, 50, 30);
+        assert_eq!(wallets.len(), 2, "Should filter out wallets with <50 fills");
+        assert!(wallets.iter().all(|w| w.total_fills >= 50));
+    }
+
+    #[test]
+    fn test_wallet_filter_positive_pnl() {
+        let now = Utc::now().to_rfc3339();
+        let mut wallets = vec![
+            HlWalletOutput {
+                address: "0xaaa".to_string(),
+                source: "hyperliquid".to_string(),
+                total_fills: 100,
+                net_pnl: 5000.0, // Positive
+                last_active: now.clone(),
+                fills: vec![],
+                account_value: Some(10000.0),
+                total_ntl_pos: None,
+                markets_traded: vec![],
+                scraped_at: now.clone(),
+            },
+            HlWalletOutput {
+                address: "0xbbb".to_string(),
+                source: "hyperliquid".to_string(),
+                total_fills: 100,
+                net_pnl: -1000.0, // Negative
+                last_active: now.clone(),
+                fills: vec![],
+                account_value: Some(5000.0),
+                total_ntl_pos: None,
+                markets_traded: vec![],
+                scraped_at: now.clone(),
+            },
+            HlWalletOutput {
+                address: "0xccc".to_string(),
+                source: "hyperliquid".to_string(),
+                total_fills: 100,
+                net_pnl: 0.0, // Zero
+                last_active: now.clone(),
+                fills: vec![],
+                account_value: Some(5000.0),
+                total_ntl_pos: None,
+                markets_traded: vec![],
+                scraped_at: now,
+            },
+        ];
+
+        apply_wallet_filters(&mut wallets, 50, 30);
+        assert_eq!(
+            wallets.len(),
+            1,
+            "Should filter out wallets with non-positive PnL"
+        );
+        assert!(wallets[0].net_pnl > 0.0);
+    }
+
+    #[test]
+    fn test_wallet_filter_active_recently() {
+        let recent = Utc::now().to_rfc3339();
+        let old_time = Utc::now()
+            .checked_sub_signed(chrono::Duration::days(60))
+            .unwrap()
+            .to_rfc3339();
+
+        let mut wallets = vec![
+            HlWalletOutput {
+                address: "0xaaa".to_string(),
+                source: "hyperliquid".to_string(),
+                total_fills: 100,
+                net_pnl: 5000.0,
+                last_active: recent, // Active now
+                fills: vec![],
+                account_value: Some(10000.0),
+                total_ntl_pos: None,
+                markets_traded: vec![],
+                scraped_at: Utc::now().to_rfc3339(),
+            },
+            HlWalletOutput {
+                address: "0xbbb".to_string(),
+                source: "hyperliquid".to_string(),
+                total_fills: 100,
+                net_pnl: 5000.0,
+                last_active: old_time, // Inactive for 60 days
+                fills: vec![],
+                account_value: Some(5000.0),
+                total_ntl_pos: None,
+                markets_traded: vec![],
+                scraped_at: Utc::now().to_rfc3339(),
+            },
+        ];
+
+        apply_wallet_filters(&mut wallets, 50, 30);
+        assert_eq!(
+            wallets.len(),
+            1,
+            "Should filter out wallets inactive >30 days"
+        );
+    }
+
+    #[test]
+    fn test_wallet_filter_combined() {
+        let now = Utc::now().to_rfc3339();
+        let mut wallets = vec![
+            // Passes all filters
+            HlWalletOutput {
+                address: "0xgood".to_string(),
+                source: "hyperliquid".to_string(),
+                total_fills: 200,
+                net_pnl: 50000.0,
+                last_active: now.clone(),
+                fills: vec![],
+                account_value: Some(100000.0),
+                total_ntl_pos: Some(50000.0),
+                markets_traded: vec!["BTC".to_string()],
+                scraped_at: now.clone(),
+            },
+            // Fails: too few fills
+            HlWalletOutput {
+                address: "0xfew_fills".to_string(),
+                source: "hyperliquid".to_string(),
+                total_fills: 10,
+                net_pnl: 5000.0,
+                last_active: now.clone(),
+                fills: vec![],
+                account_value: Some(5000.0),
+                total_ntl_pos: None,
+                markets_traded: vec![],
+                scraped_at: now.clone(),
+            },
+            // Fails: negative PnL
+            HlWalletOutput {
+                address: "0xneg_pnl".to_string(),
+                source: "hyperliquid".to_string(),
+                total_fills: 100,
+                net_pnl: -500.0,
+                last_active: now.clone(),
+                fills: vec![],
+                account_value: Some(5000.0),
+                total_ntl_pos: None,
+                markets_traded: vec![],
+                scraped_at: now.clone(),
+            },
+            // Passes all
+            HlWalletOutput {
+                address: "0xgood2".to_string(),
+                source: "hyperliquid".to_string(),
+                total_fills: 80,
+                net_pnl: 1200.0,
+                last_active: now.clone(),
+                fills: vec![],
+                account_value: Some(8000.0),
+                total_ntl_pos: None,
+                markets_traded: vec!["ETH".to_string()],
+                scraped_at: now,
+            },
+        ];
+
+        apply_wallet_filters(&mut wallets, 50, 30);
+        assert_eq!(
+            wallets.len(),
+            2,
+            "Should keep 2 wallets that pass all filters"
+        );
+        let addresses: Vec<&str> = wallets.iter().map(|w| w.address.as_str()).collect();
+        assert!(addresses.contains(&"0xgood"));
+        assert!(addresses.contains(&"0xgood2"));
+    }
+
+    #[test]
+    fn test_resolve_quicknode_url() {
+        // CLI URL takes priority
+        let url = resolve_quicknode_url(&Some("https://example.com/qn".to_string()));
+        assert_eq!(url, Some("https://example.com/qn".to_string()));
+
+        // Empty CLI URL returns None
+        let url = resolve_quicknode_url(&Some(String::new()));
+        assert_eq!(url, None);
+
+        // None returns None
+        let url = resolve_quicknode_url(&None);
+        assert_eq!(url, None);
+    }
+
+    #[test]
+    fn test_hl_wallet_output_serialization_roundtrip() {
+        let now = Utc::now().to_rfc3339();
+        let entry = HlWalletOutput {
+            address: "0xabcdef1234567890abcdef1234567890abcdef12".to_string(),
+            source: "hyperliquid".to_string(),
+            total_fills: 75,
+            net_pnl: 3500.75,
+            last_active: "2026-05-15T10:30:00+00:00".to_string(),
+            fills: vec![
+                FillRecord {
+                    coin: "BTC".to_string(),
+                    side: "B".to_string(),
+                    px: "77000.0".to_string(),
+                    sz: "0.5".to_string(),
+                    fee: "0.77".to_string(),
+                    closed_pnl: "100.0".to_string(),
+                    time: 1779368586925,
+                    dir: "Open Long".to_string(),
+                    hash: "0xdeadbeef".to_string(),
+                },
+                FillRecord {
+                    coin: "ETH".to_string(),
+                    side: "A".to_string(),
+                    px: "3500.0".to_string(),
+                    sz: "2.0".to_string(),
+                    fee: "0.35".to_string(),
+                    closed_pnl: "-50.0".to_string(),
+                    time: 1779368590000,
+                    dir: "Close Long".to_string(),
+                    hash: "0xcafebabe".to_string(),
+                },
+            ],
+            account_value: Some(25000.0),
+            total_ntl_pos: Some(10000.0),
+            markets_traded: vec!["BTC".to_string(), "ETH".to_string()],
+            scraped_at: now,
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let deserialized: HlWalletOutput = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.address, entry.address);
+        assert_eq!(deserialized.total_fills, entry.total_fills);
+        assert_eq!(deserialized.fills.len(), 2);
+    }
+
+    #[test]
+    fn test_hl_wallet_sort_by_pnl() {
+        let now = Utc::now().to_rfc3339();
+        let mut wallets = vec![
+            HlWalletOutput {
+                address: "0xlow".to_string(),
+                source: "hyperliquid".to_string(),
+                total_fills: 100,
+                net_pnl: 100.0,
+                last_active: now.clone(),
+                fills: vec![],
+                account_value: None,
+                total_ntl_pos: None,
+                markets_traded: vec![],
+                scraped_at: now.clone(),
+            },
+            HlWalletOutput {
+                address: "0xhigh".to_string(),
+                source: "hyperliquid".to_string(),
+                total_fills: 200,
+                net_pnl: 50000.0,
+                last_active: now.clone(),
+                fills: vec![],
+                account_value: None,
+                total_ntl_pos: None,
+                markets_traded: vec![],
+                scraped_at: now.clone(),
+            },
+            HlWalletOutput {
+                address: "0xmid".to_string(),
+                source: "hyperliquid".to_string(),
+                total_fills: 150,
+                net_pnl: 5000.0,
+                last_active: now.clone(),
+                fills: vec![],
+                account_value: None,
+                total_ntl_pos: None,
+                markets_traded: vec![],
+                scraped_at: now,
+            },
+        ];
+
+        wallets.sort_by(|a, b| {
+            b.net_pnl
+                .partial_cmp(&a.net_pnl)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        assert_eq!(wallets[0].address, "0xhigh");
+        assert_eq!(wallets[1].address, "0xmid");
+        assert_eq!(wallets[2].address, "0xlow");
+    }
+
+    #[test]
+    fn test_fill_record_parsing() {
+        let raw: serde_json::Value = serde_json::json!({
+            "coin": "BTC",
+            "side": "B",
+            "px": "77000.5",
+            "sz": "0.001",
+            "fee": "0.077",
+            "closedPnl": "50.25",
+            "time": 1779368586925_i64,
+            "dir": "Open Long",
+            "hash": "0xabc123def456",
+            "startPosition": "0.5"
+        });
+
+        let fill = FillRecord {
+            coin: raw
+                .get("coin")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            side: raw
+                .get("side")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            px: raw
+                .get("px")
+                .and_then(|v| v.as_str())
+                .unwrap_or("0")
+                .to_string(),
+            sz: raw
+                .get("sz")
+                .and_then(|v| v.as_str())
+                .unwrap_or("0")
+                .to_string(),
+            fee: raw
+                .get("fee")
+                .and_then(|v| v.as_str())
+                .unwrap_or("0")
+                .to_string(),
+            closed_pnl: raw
+                .get("closedPnl")
+                .and_then(|v| v.as_str())
+                .unwrap_or("0")
+                .to_string(),
+            time: raw.get("time").and_then(|v| v.as_i64()).unwrap_or(0),
+            dir: raw
+                .get("dir")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            hash: raw
+                .get("hash")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        };
+
+        assert_eq!(fill.coin, "BTC");
+        assert_eq!(fill.side, "B");
+        assert_eq!(fill.px, "77000.5");
+        assert_eq!(fill.sz, "0.001");
+        assert_eq!(fill.fee, "0.077");
+        assert_eq!(fill.closed_pnl, "50.25");
+        assert_eq!(fill.time, 1779368586925);
+        assert_eq!(fill.dir, "Open Long");
+        assert_eq!(fill.hash, "0xabc123def456");
+    }
+
+    #[test]
+    fn test_batch_validate_response_parsing() {
+        // Simulate QuickNode batch response
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "successful_states": [
+                    ["0xabc123", {
+                        "marginSummary": {
+                            "accountValue": "10000.5",
+                            "totalNtlPos": "5000.0",
+                            "totalRawUsd": "10000.5",
+                            "totalMarginUsed": "2500.0"
+                        },
+                        "crossMarginSummary": {
+                            "accountValue": "10000.5",
+                            "totalNtlPos": "5000.0"
+                        },
+                        "assetPositions": []
+                    }],
+                    ["0xdef456", {
+                        "marginSummary": {
+                            "accountValue": "0.0",
+                            "totalNtlPos": "0.0"
+                        }
+                    }]
+                ],
+                "failed_wallets": []
+            },
+            "id": 1
+        });
+
+        let result = response.get("result").unwrap();
+        let states = result.get("successful_states").unwrap().as_array().unwrap();
+        assert_eq!(states.len(), 2);
+
+        // Parse first state
+        let first = &states[0].as_array().unwrap();
+        let addr = first[0].as_str().unwrap();
+        assert_eq!(addr, "0xabc123");
+        let account_value = first[1]
+            .get("marginSummary")
+            .and_then(|m| m.get("accountValue"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok());
+        assert_eq!(account_value, Some(10000.5));
     }
 
     // Helper functions for address validation

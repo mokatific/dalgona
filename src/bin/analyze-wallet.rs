@@ -528,9 +528,11 @@ async fn fetch_flash_wallet_data(
     address: &str,
 ) -> Result<WalletData> {
     // Fetch from both fstats PnL and volume leaderboards to get full data
-    let mut data = WalletData::default();
-    data.address = address.to_string();
-    data.source = "flash-trade".to_string();
+    let mut data = WalletData {
+        address: address.to_string(),
+        source: "flash-trade".to_string(),
+        ..Default::default()
+    };
 
     // Try fstats PnL leaderboard
     for endpoint in &["pnl", "volume"] {
@@ -581,21 +583,20 @@ async fn fetch_flash_wallet_data(
     // Try Flash Trade API for current positions (gives market info)
     rate_limiter.throttle(FLASH_HOST).await;
     let positions_url = format!(
-        "{}/positions?owner={}&includePnlInLeverageDisplay=true",
+        "{}/positions/owner/{}?includePnlInLeverageDisplay=true",
         FLASH_API, address
     );
     match client.get(&positions_url).send().await {
         Ok(resp) => {
-            if resp.status().is_success() {
-                if let Ok(text) = resp.text().await {
-                    if let Ok(positions) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
-                        for pos in &positions {
-                            if let Some(asset) = pos.get("asset").and_then(|v| v.as_str()) {
-                                let sym = asset.to_uppercase();
-                                if !data.markets.contains(&sym) {
-                                    data.markets.push(sym);
-                                }
-                            }
+            if resp.status().is_success()
+                && let Ok(text) = resp.text().await
+                && let Ok(positions) = serde_json::from_str::<Vec<serde_json::Value>>(&text)
+            {
+                for pos in &positions {
+                    if let Some(asset) = pos.get("marketSymbol").and_then(|v| v.as_str()) {
+                        let sym = asset.to_uppercase();
+                        if !data.markets.contains(&sym) && sym != "UNKNOWN" {
+                            data.markets.push(sym);
                         }
                     }
                 }
@@ -622,9 +623,11 @@ async fn fetch_jupiter_wallet_data(
     rate_limiter: &RateLimiter,
     address: &str,
 ) -> Result<WalletData> {
-    let mut data = WalletData::default();
-    data.address = address.to_string();
-    data.source = "jupiter".to_string();
+    let mut data = WalletData {
+        address: address.to_string(),
+        source: "jupiter".to_string(),
+        ..Default::default()
+    };
 
     // Query Jupiter trader-stats for known markets
     let market_mints = [
@@ -648,20 +651,19 @@ async fn fetch_jupiter_wallet_data(
         );
         match fetch_json::<JupiterTraderStats>(client, rate_limiter, JUPITER_HOST, &url).await {
             Ok(stats) => {
-                if let Some(vol) = &stats.total_volume_usd {
-                    if let Ok(v) = vol.parse::<f64>() {
-                        if v > 0.0 {
-                            data.volume_usd += v;
-                            if !data.markets.contains(&symbol.to_string()) {
-                                data.markets.push(symbol.to_string());
-                            }
-                        }
+                if let Some(vol) = &stats.total_volume_usd
+                    && let Ok(v) = vol.parse::<f64>()
+                    && v > 0.0
+                {
+                    data.volume_usd += v;
+                    if !data.markets.contains(&symbol.to_string()) {
+                        data.markets.push(symbol.to_string());
                     }
                 }
-                if let Some(pnl) = &stats.total_pnl_usd {
-                    if let Ok(p) = pnl.parse::<f64>() {
-                        data.gross_pnl_usd += p;
-                    }
+                if let Some(pnl) = &stats.total_pnl_usd
+                    && let Ok(p) = pnl.parse::<f64>()
+                {
+                    data.gross_pnl_usd += p;
                 }
             }
             Err(e) => {
@@ -687,9 +689,11 @@ async fn fetch_hyperliquid_wallet_data(
     rate_limiter: &RateLimiter,
     address: &str,
 ) -> Result<WalletData> {
-    let mut data = WalletData::default();
-    data.address = address.to_string();
-    data.source = "hyperliquid".to_string();
+    let mut data = WalletData {
+        address: address.to_string(),
+        source: "hyperliquid".to_string(),
+        ..Default::default()
+    };
 
     let body = serde_json::json!({
         "type": "userFills",
@@ -713,21 +717,21 @@ async fn fetch_hyperliquid_wallet_data(
             let mut _total_directional = 0u64;
 
             for fill in &fills {
-                if let Some(pnl_str) = &fill.closed_pnl {
-                    if let Ok(pnl) = pnl_str.parse::<f64>() {
-                        total_pnl += pnl;
-                        if pnl > 0.0 {
-                            wins += 1;
-                        } else if pnl < 0.0 {
-                            losses += 1;
-                        }
+                if let Some(pnl_str) = &fill.closed_pnl
+                    && let Ok(pnl) = pnl_str.parse::<f64>()
+                {
+                    total_pnl += pnl;
+                    if pnl > 0.0 {
+                        wins += 1;
+                    } else if pnl < 0.0 {
+                        losses += 1;
                     }
                 }
 
-                if let Some(fee_str) = &fill.fee {
-                    if let Ok(fee) = fee_str.parse::<f64>() {
-                        total_fee += fee.abs();
-                    }
+                if let Some(fee_str) = &fill.fee
+                    && let Ok(fee) = fee_str.parse::<f64>()
+                {
+                    total_fee += fee.abs();
                 }
 
                 if let Some(coin) = &fill.coin {
@@ -917,10 +921,10 @@ fn compute_metrics(data: &WalletData) -> WalletMetrics {
         if !data.fills.is_empty() {
             let mut pnls: Vec<f64> = Vec::new();
             for fill in &data.fills {
-                if let Some(pnl_str) = &fill.closed_pnl {
-                    if let Ok(pnl) = pnl_str.parse::<f64>() {
-                        pnls.push(pnl);
-                    }
+                if let Some(pnl_str) = &fill.closed_pnl
+                    && let Ok(pnl) = pnl_str.parse::<f64>()
+                {
+                    pnls.push(pnl);
                 }
             }
             if !pnls.is_empty() {
@@ -1188,10 +1192,10 @@ fn classify_strategy(metrics: &WalletMetrics, data: &WalletData) -> (String, f64
     if win_rate > 55.0 && win_rate < 80.0 {
         mr_score += 0.15;
     }
-    if let Some(skewness) = metrics.pnl_skewness {
-        if skewness.abs() < 1.0 {
-            mr_score += 0.15; // Tight PnL range
-        }
+    if let Some(skewness) = metrics.pnl_skewness
+        && skewness.abs() < 1.0
+    {
+        mr_score += 0.15; // Tight PnL range
     }
     if market_concentration < 80.0 {
         mr_score += 0.10; // Trades multiple markets
@@ -1199,12 +1203,12 @@ fn classify_strategy(metrics: &WalletMetrics, data: &WalletData) -> (String, f64
     if fill_interval < 1800.0 {
         mr_score += 0.10;
     }
-    if let Some(max_winner) = metrics.pnl_max_winner_usd {
-        if let Some(mean) = metrics.pnl_mean_usd {
-            if mean != 0.0 && (max_winner / mean.abs()).abs() < 3.0 {
-                mr_score += 0.10; // Small max winner relative to avg
-            }
-        }
+    if let Some(max_winner) = metrics.pnl_max_winner_usd
+        && let Some(mean) = metrics.pnl_mean_usd
+        && mean != 0.0
+        && (max_winner / mean.abs()).abs() < 3.0
+    {
+        mr_score += 0.10; // Small max winner relative to avg
     }
     scores.insert("mean-reversion", mr_score);
 
@@ -1220,10 +1224,10 @@ fn classify_strategy(metrics: &WalletMetrics, data: &WalletData) -> (String, f64
     if win_rate > 40.0 && win_rate < 65.0 {
         tf_score += 0.15; // Moderate win rate
     }
-    if let Some(skewness) = metrics.pnl_skewness {
-        if skewness > 0.5 {
-            tf_score += 0.15; // Positive skew (large winners)
-        }
+    if let Some(skewness) = metrics.pnl_skewness
+        && skewness > 0.5
+    {
+        tf_score += 0.15; // Positive skew (large winners)
     }
     if scale_in > 30.0 {
         tf_score += 0.10; // Scales into positions
@@ -1240,10 +1244,10 @@ fn classify_strategy(metrics: &WalletMetrics, data: &WalletData) -> (String, f64
     if market_concentration > 80.0 {
         lc_score += 0.25;
     }
-    if let Some(cp) = metrics.counterparty_concentration_pct {
-        if cp > 70.0 {
-            lc_score += 0.20;
-        }
+    if let Some(cp) = metrics.counterparty_concentration_pct
+        && cp > 70.0
+    {
+        lc_score += 0.20;
     }
     if clip_consistency > 50.0 {
         lc_score += 0.15;
@@ -1262,7 +1266,7 @@ fn classify_strategy(metrics: &WalletMetrics, data: &WalletData) -> (String, f64
     // --- Swing Trader ---
     // Moderate hold times, moderate direction, varied sizes
     let mut st_score = 0.0;
-    if hold_median >= 1800.0 && hold_median <= 86400.0 {
+    if (1800.0..=86400.0).contains(&hold_median) {
         st_score += 0.25;
     }
     if (direction_bias - 0.5).abs() < 0.3 {
@@ -1294,10 +1298,10 @@ fn classify_strategy(metrics: &WalletMetrics, data: &WalletData) -> (String, f64
     if fill_interval < 10.0 {
         hft_score += 0.20;
     }
-    if let Some(markets) = &metrics.markets_traded {
-        if markets.len() >= 3 {
-            hft_score += 0.15;
-        }
+    if let Some(markets) = &metrics.markets_traded
+        && markets.len() >= 3
+    {
+        hft_score += 0.15;
     }
     if data.total_trades > 500 {
         hft_score += 0.20;
@@ -1322,12 +1326,12 @@ fn classify_strategy(metrics: &WalletMetrics, data: &WalletData) -> (String, f64
     if win_rate > 50.0 && win_rate < 70.0 {
         gm_score += 0.15;
     }
-    if let Some(max_winner) = metrics.pnl_max_winner_usd {
-        if let Some(max_loser) = metrics.pnl_max_loser_usd {
-            if max_winner.abs() > 0.0 && max_loser.abs() > max_winner.abs() * 3.0 {
-                gm_score += 0.10; // Large losers relative to winners (martingale-like)
-            }
-        }
+    if let Some(max_winner) = metrics.pnl_max_winner_usd
+        && let Some(max_loser) = metrics.pnl_max_loser_usd
+        && max_winner.abs() > 0.0
+        && max_loser.abs() > max_winner.abs() * 3.0
+    {
+        gm_score += 0.10; // Large losers relative to winners (martingale-like)
     }
     scores.insert("grid-martingale", gm_score);
 
