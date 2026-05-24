@@ -1,7 +1,54 @@
 use std::collections::VecDeque;
 use tracing::{debug, info, warn};
 
+/// Tracks previous pool utilization values to compute utilization velocity.
+/// Used by engine tick loops to construct `PoolSnapshot` with accurate velocity data.
+#[derive(Debug, Clone, Default)]
+pub struct PoolStateTracker {
+    prev_long_utilization: Option<f64>,
+    prev_short_utilization: Option<f64>,
+}
+
+impl PoolStateTracker {
+    /// Create a new tracker with no previous state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a `PoolSnapshot` from raw pool info, computing velocity from the
+    /// previous tick's utilization values.
+    ///
+    /// On the first call, velocity is 0.0 for both sides (no previous data).
+    pub fn compute_snapshot(
+        &mut self,
+        aum_usd: f64,
+        long_utilization: f64,
+        short_utilization: f64,
+    ) -> PoolSnapshot {
+        let long_vel = match self.prev_long_utilization {
+            Some(prev) => long_utilization - prev,
+            None => 0.0,
+        };
+        let short_vel = match self.prev_short_utilization {
+            Some(prev) => short_utilization - prev,
+            None => 0.0,
+        };
+
+        self.prev_long_utilization = Some(long_utilization);
+        self.prev_short_utilization = Some(short_utilization);
+
+        PoolSnapshot {
+            aum_usd,
+            long_utilization,
+            short_utilization,
+            long_utilization_velocity: long_vel,
+            short_utilization_velocity: short_vel,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 pub enum Signal {
     MomentumLong { strength: f64, velocity_pct: f64 },
     MomentumShort { strength: f64, velocity_pct: f64 },
@@ -21,6 +68,7 @@ pub enum ExitReason {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PricePoint {
     pub price: f64,
     pub timestamp_ms: i64,
@@ -34,6 +82,7 @@ pub struct MomentumDetector {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MomentumSnapshot {
     pub price_count: usize,
     pub current_price: f64,
@@ -225,6 +274,7 @@ impl MomentumDetector {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn detect_exit(
         &self,
         snapshot: &MomentumSnapshot,
@@ -339,4 +389,68 @@ fn compute_signal_strength(
     let consecutive_score = (consecutive.abs() as f64 / lookback as f64).min(1.0) * 30.0;
     let volatility_penalty = volatility.min(20.0);
     (velocity_score + consecutive_score - volatility_penalty).max(0.0)
+}
+
+#[cfg(test)]
+mod pool_tracker_tests {
+    use super::*;
+
+    #[test]
+    fn test_pool_tracker_first_tick_zero_velocity() {
+        let mut tracker = PoolStateTracker::new();
+        let snap = tracker.compute_snapshot(1_000_000.0, 0.3, 0.2);
+        assert!((snap.aum_usd - 1_000_000.0).abs() < 0.01);
+        assert!((snap.long_utilization - 0.3).abs() < 0.001);
+        assert!((snap.short_utilization - 0.2).abs() < 0.001);
+        // First tick: velocity should be 0 (no previous data)
+        assert!((snap.long_utilization_velocity - 0.0).abs() < 0.001);
+        assert!((snap.short_utilization_velocity - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_pool_tracker_computes_velocity() {
+        let mut tracker = PoolStateTracker::new();
+
+        // Tick 1: long=0.3, short=0.2
+        let snap1 = tracker.compute_snapshot(1_000_000.0, 0.3, 0.2);
+        assert!((snap1.long_utilization_velocity).abs() < 0.001);
+
+        // Tick 2: long=0.5, short=0.15
+        let snap2 = tracker.compute_snapshot(1_000_000.0, 0.5, 0.15);
+        assert!(
+            (snap2.long_utilization_velocity - 0.2).abs() < 0.001,
+            "long velocity should be 0.5 - 0.3 = 0.2"
+        );
+        assert!(
+            (snap2.short_utilization_velocity - (-0.05)).abs() < 0.001,
+            "short velocity should be 0.15 - 0.2 = -0.05"
+        );
+
+        // Tick 3: long=0.8, short=0.1
+        let snap3 = tracker.compute_snapshot(1_200_000.0, 0.8, 0.1);
+        assert!(
+            (snap3.long_utilization_velocity - 0.3).abs() < 0.001,
+            "long velocity should be 0.8 - 0.5 = 0.3"
+        );
+        assert!((snap3.short_utilization_velocity - (-0.05)).abs() < 0.001);
+        assert!((snap3.aum_usd - 1_200_000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_pool_tracker_velocity_with_stable_utilization() {
+        let mut tracker = PoolStateTracker::new();
+        tracker.compute_snapshot(1_000_000.0, 0.5, 0.5);
+
+        // Same utilization → zero velocity
+        let snap = tracker.compute_snapshot(1_000_000.0, 0.5, 0.5);
+        assert!((snap.long_utilization_velocity).abs() < 0.001);
+        assert!((snap.short_utilization_velocity).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_pool_tracker_default_is_new() {
+        let tracker = PoolStateTracker::default();
+        assert!(tracker.prev_long_utilization.is_none());
+        assert!(tracker.prev_short_utilization.is_none());
+    }
 }

@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::info;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Position {
     pub position_key: String,
     pub symbol: String,
@@ -110,15 +111,14 @@ impl RiskManager {
             return Err("Trading HALTED — circuit breaker triggered".into());
         }
 
-        if let Ok(guard) = self.cooldown_until.lock() {
-            if let Some(until) = *guard {
-                if Utc::now() < until {
-                    return Err(format!(
-                        "Cooldown active until {}",
-                        until.format("%H:%M:%S")
-                    ));
-                }
-            }
+        if let Ok(guard) = self.cooldown_until.lock()
+            && let Some(until) = *guard
+            && Utc::now() < until
+        {
+            return Err(format!(
+                "Cooldown active until {}",
+                until.format("%H:%M:%S")
+            ));
         }
 
         let daily_pnl = *self.daily_pnl.lock().unwrap();
@@ -200,6 +200,7 @@ impl RiskManager {
         self.halted.load(Ordering::Relaxed)
     }
 
+    #[allow(dead_code)]
     pub fn total_fees(&self) -> f64 {
         *self.total_fees.lock().unwrap()
     }
@@ -304,16 +305,17 @@ impl TradeLog {
     fn flush(&self) {
         if let Ok(json) = serde_json::to_string_pretty(&self.trades) {
             let tmp_path = format!("{}.tmp", self.filepath);
-            if std::fs::write(&tmp_path, &json).is_ok() {
-                if std::fs::rename(&tmp_path, &self.filepath).is_err() {
-                    let _ = std::fs::write(&self.filepath, &json);
-                }
+            if std::fs::write(&tmp_path, &json).is_ok()
+                && std::fs::rename(&tmp_path, &self.filepath).is_err()
+            {
+                let _ = std::fs::write(&self.filepath, &json);
             }
         }
     }
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct TradeStats {
     pub total_trades: usize,
     pub wins: usize,

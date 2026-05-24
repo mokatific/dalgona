@@ -255,6 +255,14 @@ pub struct RiskConfig {
     pub max_position_notional_usd: f64,
     pub max_daily_loss_usd: f64,
     pub max_drawdown_pct: f64,
+    /// Maximum total notional exposure across ALL open positions (cross-cell limit).
+    /// New positions are rejected if total open notional + new position notional > this value.
+    #[serde(default = "default_max_total_notional_usd")]
+    pub max_total_notional_usd: f64,
+}
+
+fn default_max_total_notional_usd() -> f64 {
+    100_000.0
 }
 
 impl Config {

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use base64::Engine;
-use bincode;
+
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
@@ -24,7 +24,7 @@ pub struct Executor {
 impl Executor {
     pub fn new(rpc_url: &str, keypair_path: &str) -> Result<Self> {
         let expanded = if keypair_path.starts_with("~/") {
-            if let Some(home) = std::env::var("HOME").ok() {
+            if let Ok(home) = std::env::var("HOME") {
                 format!("{}{}", home, &keypair_path[1..])
             } else {
                 keypair_path.to_string()
@@ -63,6 +63,7 @@ impl Executor {
     }
 
     /// Get SOL balance in lamports.
+    #[allow(dead_code)]
     pub fn get_balance(&self) -> Result<u64> {
         Ok(self.rpc.get_balance(&self.keypair.pubkey())?)
     }
@@ -103,6 +104,7 @@ impl Executor {
 
         // Fetch a fresh blockhash via spawn_blocking (RPC calls are synchronous)
         let rpc = self.rpc.clone();
+        #[allow(clippy::result_large_err)]
         let recent_blockhash = tokio::task::spawn_blocking(move || rpc.get_latest_blockhash())
             .await
             .context("spawn_blocking panicked")?
