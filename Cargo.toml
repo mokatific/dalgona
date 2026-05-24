@@ -2,7 +2,8 @@
 name = "dalgona"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "AGPL-3.0-or-later"
+license-file = "LICENSE"
 
 [workspace]
 
@@ -17,6 +18,10 @@ path = "src/bin/scrape-leaderboards.rs"
 [[bin]]
 name = "analyze-wallet"
 path = "src/bin/analyze-wallet.rs"
+
+[[bin]]
+name = "scan-markets"
+path = "src/bin/scan-markets.rs"
 
 [dependencies]
 # Async
