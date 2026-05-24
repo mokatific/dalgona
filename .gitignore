@@ -2,6 +2,7 @@
 /target
 
 # Generated data
+.ruff_cache
 *.json
 !.gitignore
 
