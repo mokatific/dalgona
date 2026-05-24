@@ -1,0 +1,32 @@
+[agent]
+poll_interval_secs = 5
+log_level = "info"
+
+[flash]
+api_url = "https://flashapi.trade"
+rpc_url = "https://api.mainnet-beta.solana.com"
+keypair_path = "~/.config/solana/id.json"
+market = "SOL"
+input_token = "USDC"
+pool = "Crypto.1"
+leverage = 10.0
+slippage_pct = "0.5"
+
+[strategy]
+direction_bias = "neutral"
+momentum_threshold_pct = 0.15
+lookback_count = 60
+scale_in_clips = 1
+clip_size_usd = 100.0
+max_hold_secs = 1800
+take_profit_pct = 2.5
+stop_loss_pct = 1.0
+trailing_stop_pct = 0.8
+trailing_activation_pct = 1.5
+cooldown_after_loss_secs = 300
+use_native_tp_sl = true
+
+[risk]
+max_position_notional_usd = 1000.0
+max_daily_loss_usd = 200.0
+max_drawdown_pct = 15.0

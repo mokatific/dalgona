@@ -1,0 +1,57 @@
+[package]
+name = "dalgona"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[[bin]]
+name = "dalgona"
+path = "src/main.rs"
+
+[dependencies]
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# HTTP
+reqwest = { version = "0.12", features = [
+  "json",
+  "rustls-tls",
+], default-features = false }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Solana
+solana-sdk = "2.2"
+solana-client = "2.2"
+
+# Encoding
+bs58 = "0.5"
+base64 = "0.22"
+bincode = "1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Utils
+dashmap = "6"
+rand = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+panic = "abort"

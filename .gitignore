@@ -1,0 +1,10 @@
+# Build outputs
+/target
+
+# Generated data
+*.json
+!.gitignore
+
+# Local environment overrides
+.env
+config/local.toml
