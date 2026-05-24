@@ -41,6 +41,27 @@ pub struct MomentumSnapshot {
     pub direction: TradeDirection,
     pub strength: f64,
     pub volatility_pct: f64,
+    /// Pool utilization data for LP consumption detection.
+    /// None when pool data is unavailable (e.g., API failure or strategy doesn't use it).
+    pub pool_data: Option<PoolSnapshot>,
+}
+
+/// Pool utilization snapshot used by LP consumption strategies.
+/// Represents the current state of a Flash Trade liquidity pool's custodies.
+#[derive(Debug, Clone)]
+pub struct PoolSnapshot {
+    /// Total assets under management in the pool, in USD.
+    pub aum_usd: f64,
+    /// Utilization ratio for the long side (0.0-1.0).
+    pub long_utilization: f64,
+    /// Utilization ratio for the short side (0.0-1.0).
+    pub short_utilization: f64,
+    /// How much the long side utilization has changed over the lookback window (velocity).
+    /// Positive = long utilization is increasing (LP bid-side being consumed).
+    pub long_utilization_velocity: f64,
+    /// How much the short side utilization has changed over the lookback window (velocity).
+    /// Positive = short utilization is increasing (LP ask-side being consumed).
+    pub short_utilization_velocity: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,6 +99,7 @@ impl MomentumDetector {
                 direction: TradeDirection::Neutral,
                 strength: 0.0,
                 volatility_pct: 0.0,
+                pool_data: None,
             };
         }
 
@@ -157,6 +179,7 @@ impl MomentumDetector {
             direction,
             strength,
             volatility_pct: max_drawdown,
+            pool_data: None,
         }
     }
 

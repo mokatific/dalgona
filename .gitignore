@@ -8,3 +8,6 @@
 # Local environment overrides
 .env
 config/local.toml
+
+# Other stuff
+backup

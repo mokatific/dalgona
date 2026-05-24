@@ -217,6 +217,24 @@ pub struct TradeRecord {
     pub hold_secs: u64,
     pub exit_reason: String,
     pub timestamp: DateTime<Utc>,
+    /// Strategy name that generated this trade (e.g. "momentum-scalper").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub strategy: String,
+    /// Market symbol for this trade (e.g. "SOL").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub market: String,
+    /// Entry fee component (from live API preview).
+    #[serde(default)]
+    pub entry_fee: f64,
+    /// Exit fee component (from live API preview or fallback).
+    #[serde(default)]
+    pub exit_fee: f64,
+    /// Accrued borrow/funding fee over the position lifetime.
+    #[serde(default)]
+    pub borrow_fee: f64,
+    /// Gross PnL before fee deductions.
+    #[serde(default)]
+    pub gross_pnl: f64,
 }
 
 pub struct TradeLog {
