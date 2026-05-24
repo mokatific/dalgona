@@ -1,29 +1,43 @@
 [agent]
-poll_interval_secs = 5
+# Polling interval for price/engine ticks. Affects borrow fee accrual (BUG-001 fix).
+poll_interval_secs = 300
 log_level = "info"
 
 [flash]
 api_url = "https://flashapi.trade"
 rpc_url = "https://api.mainnet-beta.solana.com"
 keypair_path = "~/.config/solana/id.json"
+# Default market for single-strategy mode. For multi-market, use --markets CLI flag.
+# Market selection informed by: cargo run --bin scan-markets -- --output data/market-rankings.json
 market = "SOL"
 input_token = "USDC"
 pool = "Crypto.1"
-leverage = 10.0
+leverage = 3.0
 slippage_pct = "0.5"
 
 [strategy]
+# Active strategy name (used when --strategies flag is not provided)
 active = "momentum-scalper"
+# Direction filter: "long", "short", or "neutral" (both directions allowed)
 direction_bias = "neutral"
+# Velocity threshold (%) for momentum detection
+# Source: placeholder value; data-driven version in [strategy.blueprint-scalper] uses cluster-001 data
 momentum_threshold_pct = 0.15
+# Number of historical price points for velocity computation
 lookback_count = 60
 scale_in_clips = 1
-clip_size_usd = 100.0
-max_hold_secs = 1800
-take_profit_pct = 2.5
-stop_loss_pct = 1.0
-trailing_stop_pct = 0.8
-trailing_activation_pct = 1.5
+# Default position size in USD
+clip_size_usd = 1000.0
+# Maximum hold duration before time-stop triggers
+max_hold_secs = 1200
+# Take-profit threshold (% gain from entry)
+take_profit_pct = 1.0
+# Stop-loss threshold (% loss from entry)
+stop_loss_pct = 0.5
+# Trailing stop: percentage retracement from peak that triggers exit
+trailing_stop_pct = 0.3
+# Trailing stop activation: minimum peak profit (%) before trailing activates
+trailing_activation_pct = 0.5
 cooldown_after_loss_secs = 300
 use_native_tp_sl = true
 
@@ -41,20 +55,18 @@ confirmation_ticks = 3
 max_utilization = 0.9
 # From blueprint: exit section
 direction_bias = "neutral"
-clip_size_usd = 100.0
-max_hold_secs = 3600
-# From blueprint: exit.take_profit_pct = 2.0
-take_profit_pct = 2.0
-# From blueprint: exit.stop_loss_pct = 1.0
-stop_loss_pct = 1.0
-# From blueprint: exit.trailing_stop_pct = 0.8
-trailing_stop_pct = 0.8
-# From blueprint: exit.trailing_activation_pct = 1.2
-trailing_activation_pct = 1.2
-# From blueprint: risk.cooldown_after_loss_secs = 300
+# Source: placeholder; data-driven versions use cluster-derived clip sizes
+clip_size_usd = 1000.0
+# Source: placeholder; data-driven versions use cluster-derived hold times
+max_hold_secs = 1200
+# Tight TP/SL for short-hold LP consumption pattern
+# Source: placeholder; data-driven versions use cluster-derived TP/SL
+take_profit_pct = 1.0
+stop_loss_pct = 0.5
+trailing_stop_pct = 0.3
+trailing_activation_pct = 0.5
 cooldown_after_loss_secs = 300
 use_native_tp_sl = true
-# From blueprint: leverage = 2.5
 leverage = 2.5
 scale_in_clips = 1
 
@@ -65,56 +77,150 @@ scale_in_clips = 1
 # Number of price points to compute the simple moving average (SMA)
 mean_lookback = 120
 # Minimum deviation from SMA (%) to detect a "spike"
+# Source: placeholder; data-driven version in [strategy.blueprint-mean-revert] uses cluster-004 data
 deviation_threshold_pct = 1.5
 # Consecutive ticks moving back toward mean to confirm reversal
 reversal_confirmation_ticks = 2
 # How close to SMA price must return (%) for mean-return exit
 mean_tolerance_pct = 0.3
 direction_bias = "neutral"
-clip_size_usd = 100.0
-# From blueprint: swing-trader exit.max_hold_secs = 28800 (scaled to 1800 for scalper)
-max_hold_secs = 1800
-# From blueprint: swing-trader exit.take_profit_pct = 4.0 (scaled to 1.0 for scalper)
+# Source: placeholder; data-driven version uses cluster-004 clip_size_usd=116.6
+clip_size_usd = 1000.0
+# Source: placeholder; data-driven version uses cluster-004 max_hold_secs=12313
+max_hold_secs = 1200
+# Source: placeholder; data-driven version uses cluster-004 take_profit_pct=0.4284
 take_profit_pct = 1.0
-# From blueprint: swing-trader exit.stop_loss_pct = 2.0 (scaled to 1.5 for scalper)
-stop_loss_pct = 1.5
+# Source: placeholder; data-driven version uses cluster-004 stop_loss_pct=0.2879
+stop_loss_pct = 0.5
 # No trailing stop for mean reversion (targets a fixed level, not momentum)
 trailing_stop_pct = 0.0
 trailing_activation_pct = 0.0
 cooldown_after_loss_secs = 300
 use_native_tp_sl = true
-leverage = 3.0
+leverage = 2.0
 scale_in_clips = 1
 
 # Trend Follower strategy
 # Enters on confirmed momentum breakouts with wider stops and trailing exits.
 # Longer holds than scalper strategies. Lower win rate but larger winners.
-# Sensible defaults (no M1 blueprint available for this pattern).
 [strategy.trend-follower]
 # Velocity threshold (%) for a "breakout" — higher than scalper (0.15)
+# Source: placeholder; see data/blueprints/cluster-003.json, cluster-006.json for data-driven values
 breakout_threshold_pct = 0.25
 # Consecutive ticks above threshold required to confirm entry
 confirmation_ticks = 4
 # Minimum price points before any entry signal
 min_price_count = 30
 direction_bias = "neutral"
-clip_size_usd = 100.0
-# Longer holds: 2h vs scalper's 30min
-max_hold_secs = 7200
-# Wider take-profit: 5% vs scalper's 2.5%
-take_profit_pct = 5.0
-# Wider stop-loss: 2% vs scalper's 1%
-stop_loss_pct = 2.0
-# Wider trailing stop: 1.5% vs scalper's 0.8%
-trailing_stop_pct = 1.5
-# Trailing activates at 2.5% profit vs scalper's 1.5%
-trailing_activation_pct = 2.5
+# Source: placeholder; data-driven versions use cluster-derived clip sizes
+clip_size_usd = 1000.0
+# Source: placeholder; data-driven versions use cluster-derived hold times
+max_hold_secs = 2400
+# Source: placeholder; data-driven versions use cluster-derived TP/SL
+take_profit_pct = 2.0
+stop_loss_pct = 0.8
+trailing_stop_pct = 0.6
+trailing_activation_pct = 1.0
 cooldown_after_loss_secs = 300
 use_native_tp_sl = true
-leverage = 5.0
+leverage = 3.0
 scale_in_clips = 1
 
+# =============================================================================
+# DATA-DRIVEN STRATEGIES (from blueprint JSON)
+# These strategies use parameters derived from actual profitable HL wallet clusters.
+# Data lineage: wallet fills → position_clusters → cluster medians → blueprint JSON → config
+# =============================================================================
+
+# Data-Driven Momentum Scalper (from cluster-001)
+# Source blueprint: data/blueprints/cluster-001.json
+# Cluster: cluster-001, 12 wallets, 4711 trades, confidence 0.73
+# Primary market: BTC, Direction: long
+# Traceability: wallet fills → position clusters → cluster medians → blueprint → this config
+[strategy.blueprint-scalper]
+# Velocity threshold (%) for momentum entry
+# Source: cluster-001 entry_conditions.parameters.price_velocity_threshold = 0.339
+# Derived from: median of 12 wallets' entry velocity patterns, N=4711 trades
+momentum_threshold_pct = 0.339
+# Number of lookback candles for velocity computation
+# Source: cluster-001 entry_conditions.lookback_candles = 6, scaled by tick multiplier 5
+lookback_count = 30
+# Position clip size in USD
+# Source: cluster-001 risk_parameters.clip_size_usd = 63.68
+# Derived from: median of 12 wallet median-fill notionals
+clip_size_usd = 63.68
+# Take-profit threshold (% gain from entry)
+# Source: cluster-001 exit_conditions.take_profit_pct = 0.002983 → 0.2983%
+# Derived from: median of 632 winning positions' price ranges
+take_profit_pct = 0.2983
+# Stop-loss threshold (% loss from entry)
+# Source: cluster-001 exit_conditions.stop_loss_pct = 0.00141 → 0.141%
+# Derived from: median of 376 losing positions' price ranges
+stop_loss_pct = 0.141
+# Maximum hold duration in seconds
+# Source: cluster-001 exit_conditions.max_hold_hours = 2.8134 → 10128s
+# Derived from: p75 of 12 wallets' avg_hold_time_hours
+max_hold_secs = 10128
+# Trailing stop disabled (cluster-001 trailing_stop = false)
+trailing_stop_pct = 0.0
+trailing_activation_pct = 0.0
+# Direction bias from cluster data
+# Source: cluster-001 direction = "long"
+direction_bias = "long"
+scale_in_clips = 1
+cooldown_after_loss_secs = 300
+use_native_tp_sl = true
+leverage = 3.0
+
+# Data-Driven Mean Reversion (from cluster-004)
+# Source blueprint: data/blueprints/cluster-004.json
+# Cluster: cluster-004, 5 wallets, 518 trades, confidence 0.83
+# Primary market: BTC, Direction: mixed
+# Traceability: wallet fills → position clusters → cluster medians → blueprint → this config
+[strategy.blueprint-mean-revert]
+# Number of price points for SMA computation
+# Source: cluster-004 entry_conditions.lookback_candles = 6, scaled by tick multiplier 5
+mean_lookback = 30
+# Minimum deviation from SMA (%) to detect a spike
+# Source: cluster-004 entry_conditions.parameters.price_velocity_threshold = 1.009
+# Derived from: median of 5 wallets' entry velocity patterns, N=518 trades
+deviation_threshold_pct = 1.009
+# Consecutive reversal ticks to confirm entry
+reversal_confirmation_ticks = 2
+# How close to SMA price must return (%) for mean-return exit
+mean_tolerance_pct = 0.3
+# Position clip size in USD
+# Source: cluster-004 risk_parameters.clip_size_usd = 116.6
+# Derived from: median of 5 wallet median-fill notionals
+clip_size_usd = 116.6
+# Take-profit threshold (% gain from entry)
+# Source: cluster-004 exit_conditions.take_profit_pct = 0.004284 → 0.4284%
+# Derived from: median of 241 winning positions' price ranges
+take_profit_pct = 0.4284
+# Stop-loss threshold (% loss from entry)
+# Source: cluster-004 exit_conditions.stop_loss_pct = 0.002879 → 0.2879%
+# Derived from: median of 114 losing positions' price ranges
+stop_loss_pct = 0.2879
+# Maximum hold duration in seconds
+# Source: cluster-004 exit_conditions.max_hold_hours = 3.4203 → 12313s
+# Derived from: p75 of 5 wallets' avg_hold_time_hours
+max_hold_secs = 12313
+# No trailing stop for mean reversion (targets a fixed level: the mean)
+trailing_stop_pct = 0.0
+trailing_activation_pct = 0.0
+# Direction bias from cluster data (mixed = trade both directions)
+# Source: cluster-004 direction = "mixed"
+direction_bias = "neutral"
+scale_in_clips = 1
+cooldown_after_loss_secs = 300
+use_native_tp_sl = true
+leverage = 3.0
+
 [risk]
-max_position_notional_usd = 1000.0
-max_daily_loss_usd = 200.0
+max_position_notional_usd = 5000.0
+max_daily_loss_usd = 500.0
 max_drawdown_pct = 15.0
+# Maximum total notional exposure across ALL open positions (cross-cell limit).
+# With 4 strategies × 2 markets, each at ~$3000, total could reach $24,000+.
+# Set a cap to prevent excessive exposure from accumulating.
+max_total_notional_usd = 100000.0
