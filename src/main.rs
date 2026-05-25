@@ -107,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
         .with_thread_ids(false)
         .init();
 
-    tracing::info!("=== Dalgona Autonomous Strategy Poacher v1.0 (Flash Trade) ===");
+    tracing::info!("=== Dalgona Autonomous Strategy Poacher v0.2.0 (Flash Trade) ===");
     tracing::info!("Config: {}", config_path.display());
     tracing::info!("Market: {}", config.flash.market);
 

@@ -58,47 +58,105 @@ cargo build --release
 cargo test
 ```
 
-Backtest example (replay Hyperliquid candles, no wallet needed):
+---
+
+## Full Pipeline (Single Command) 🔁
+
+Run the entire Discover → Analyze → Implement → Backtest pipeline:
+
+```bash
+# Stages 1-4 (safe, no real money)
+./scripts/run_pipeline.sh
+
+# Stages 1-5 (includes paper trading)
+./scripts/run_pipeline.sh --paper
+
+# Stages 1-6 (includes live — requires human approval)
+./scripts/run_pipeline.sh --live --keypair ~/.config/solana/id.json
+```
+
+Run individual stages or ranges:
+
+```bash
+# Only stage 3 (inject blueprints into config)
+./scripts/run_pipeline.sh --stage 3
+
+# Stages 3-5 (skip discovery/analysis, go straight to backtest+paper)
+./scripts/run_pipeline.sh --from 3 --to 5
+
+# Custom backtest period and markets
+./scripts/run_pipeline.sh --start 2026-05-01 --end 2026-05-15 --markets BTC,SOL,ETH
+```
+
+### Pipeline Stages
+
+| # | Stage | Tool | Safe? |
+|---|-------|------|-------|
+| 1 | **Discover** — Scrape HL leaderboards via QuickNode | `scrape-leaderboards` (Rust) | ✅ |
+| 2 | **Analyze** — Cluster fills, classify strategies, generate blueprints | `run_analysis.py` (Python) | ✅ |
+| 3 | **Implement** — Inject blueprint params into Rust config | `inject_blueprints.py` | ✅ |
+| 4 | **Backtest** — Validate on historical HL candles | `dalgona --backtest` (Rust) | ✅ |
+| 5 | **Paper Trade** — Live Flash Trade prices, simulated PnL | `dalgona --paper` (Rust) | ✅ |
+| 6 | **Live** — Real on-chain execution | `dalgona` (Rust) | ⚠️ Requires approval |
+
+### Promotion Gates
+
+Strategies must pass quality gates to advance:
+
+- **Backtest → Paper**: Sharpe ≥ 0.5, win rate ≥ 35%, positive PnL
+- **Paper → Live**: Sharpe ≥ 1.0, win rate ≥ 40%, positive PnL, ≥ 10 trades
+- **Live**: Requires typing `EXECUTE` to confirm
+
+Gate evaluation: `python scripts/evaluate_gate.py --stage backtest`
+
+Pipeline state tracked in: `data/pipeline-state.json`
+
+---
+
+## Individual Stage Commands
+
+Wallet discovery (QuickNode HyperCore required):
+
+```bash
+export QUICKNODE_HL_URL="https://your-endpoint.quiknode.pro/your-token/"
+cargo run --bin scrape-leaderboards -- --source hyperliquid --quicknode-url $QUICKNODE_HL_URL --output data/wallets-hl.json
+```
+
+Python analysis pipeline:
+
+```bash
+python scripts/run_analysis.py
+```
+
+Blueprint injection (dry run first, then for real):
+
+```bash
+python scripts/inject_blueprints.py --dry-run
+python scripts/inject_blueprints.py
+```
+
+Backtest:
 
 ```bash
 ./target/release/dalgona --backtest \
-  --strategies momentum-scalper,mean-reversion \
+  --strategies blueprint-cluster-001,blueprint-cluster-003 \
   --markets BTC,SOL,ETH \
   --backtest-start 2026-05-01 --backtest-end 2026-05-15 \
   --backtest-interval 5m --paper-balance 1000
 ```
 
-Paper trading (live prices, simulated PnL):
+Paper trading:
 
 ```bash
 ./target/release/dalgona --paper \
-  --strategies momentum-scalper,lp-consumption \
+  --strategies blueprint-cluster-001,momentum-scalper \
   --markets SOL,BTC,ETH --paper-balance 1000
-```
-
-Dry run (preview one cycle):
-
-```bash
-./target/release/dalgona --dry-run
 ```
 
 Live (requires funded Solana keypair and human approval):
 
 ```bash
 ./target/release/dalgona --keypair ~/.config/solana/id.json --market SOL
-```
-
-Wallet discovery (QuickNode HyperCore required):
-
-```bash
-export QUICKNODE_HL_URL="https://your-endpoint.quiknode.pro/your-token/"
-cargo run --bin scrape-leaderboards -- --quicknode-url $QUICKNODE_HL_URL --output data/wallets-hl.json
-```
-
-Analyze discovered wallets (Rust):
-
-```bash
-cargo run --bin analyze-wallet -- --wallets data/wallets-hl.json --output data/reports/
 ```
 
 Run Python analysis tests:
@@ -159,10 +217,18 @@ src/ — Rust core: `main.rs`, `strategy.rs`, `backtest.rs`, `flash_api.rs`, `ex
 
 analysis/ — Python analysis code and unit tests.
 
+scripts/ — Pipeline orchestration:
+
+- `run_pipeline.sh` — full 6-stage pipeline orchestrator
+- `inject_blueprints.py` — blueprint JSON → TOML config bridge
+- `evaluate_gate.py` — backtest/paper gate evaluator
+- `run-dalgona.sh` — single-strategy live launcher
+
 CLI bins:
 
 - `scrape-leaderboards` — discover wallets (QuickNode HyperCore)
 - `analyze-wallet` — analyze wallets & generate blueprints
+- `scan-markets` — rank Flash Trade markets by volume/spread
 
 ---
 

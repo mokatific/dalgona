@@ -216,9 +216,9 @@ def _describe_exit_conditions(strategy: str, params: dict) -> str:
     """Human-readable exit condition description."""
     tp = params.get("tp_sl", {}).get("median_tp_pct", 0)
     sl = params.get("tp_sl", {}).get("median_sl_pct", 0)
-    hold = params.get("hold_time", {}).get("p75_hours", 0)
+    hold = params.get("hold_time", {}).get("position_median_hours", 0)
 
-    return f"TP at {tp:.2%}, SL at {sl:.2%}, max hold {hold:.1f}h (p75)"
+    return f"TP at {tp:.2%}, SL at {sl:.2%}, max hold {hold:.1f}h (position median)"
 
 
 def generate_blueprint(
@@ -285,25 +285,35 @@ def generate_blueprint(
     # Strategy name
     strategy_name = f"{strategy}_{market}_{direction}".lower().replace(" ", "_")
 
+    # Pull TP/SL stats up-front; entry threshold derives from them.
+    tp_sl = params.get("tp_sl", {})
+
+    # Entry trigger magnitude (in percent units, matching the Rust config's
+    # *_threshold_pct fields). The wallet's median winning move is the best
+    # available proxy for "typical actionable move size" in this cluster.
+    # Previous versions used hold-time-in-hours here, which was dimensionally
+    # wrong and produced nonsense thresholds (e.g. 0.6 "%" = 0.6h).
+    velocity_threshold_pct = round(tp_sl.get("median_tp_pct", 0.0015) * 100.0, 4)
+
     # Build entry conditions from parameters
     entry_conditions = {
         "description": _describe_entry_conditions(strategy, params),
         "lookback_candles": 6,
         "parameters": {
-            "price_velocity_threshold": params.get("hold_time", {}).get(
-                "position_median_hours", 0
-            ),
+            "price_velocity_threshold": velocity_threshold_pct,
             "volume_spike_threshold_sd": 1.5,
         },
     }
 
-    # Build exit conditions from TP/SL data
-    tp_sl = params.get("tp_sl", {})
+    # Position-level median is more robust than p75-of-wallet-averages: the
+    # latter compounds outliers (one wallet's tail position drags its wallet
+    # mean up, then p75 picks that wallet) and produces wildly long holds.
+    hold_median = params.get("hold_time", {}).get("position_median_hours", 0)
     exit_conditions = {
         "description": _describe_exit_conditions(strategy, params),
         "take_profit_pct": tp_sl.get("median_tp_pct", 0),
         "stop_loss_pct": tp_sl.get("median_sl_pct", 0),
-        "max_hold_hours": params.get("hold_time", {}).get("p75_hours", 0),
+        "max_hold_hours": hold_median,
         "trailing_stop": strategy in ("trend_follower",),
     }
 
@@ -311,7 +321,7 @@ def generate_blueprint(
     clip = params.get("clip_size", {})
     risk_parameters = {
         "clip_size_usd": clip.get("median_notional", 0),
-        "max_hold_hours": params.get("hold_time", {}).get("p75_hours", 0),
+        "max_hold_hours": hold_median,
         "position_size_pct": clip.get("position_median_size", 0),
     }
 
@@ -319,12 +329,14 @@ def generate_blueprint(
     n_wallets = len(cluster_member_profiles)
     n_win = tp_sl.get("num_winning_positions", 0)
     n_lose = tp_sl.get("num_losing_positions", 0)
+    n_positions = n_win + n_lose
 
     parameter_traceability = {
         "clip_size_usd": f"median of {n_wallets} wallet median-fill notionals",
         "take_profit_pct": f"median of {n_win} winning positions' price ranges",
         "stop_loss_pct": f"median of {n_lose} losing positions' price ranges",
-        "max_hold_hours": f"p75 of {n_wallets} wallets' avg_hold_time_hours",
+        "max_hold_hours": f"position-level median across {n_positions} positions",
+        "price_velocity_threshold": f"median TP magnitude across {n_win} winning positions (% units)",
         "confidence_score": f"mean of {len(confidences)} wallet classification confidences",
     }
 

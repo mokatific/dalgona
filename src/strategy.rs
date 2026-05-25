@@ -1719,6 +1719,36 @@ pub fn available_strategies() -> &'static [&'static str] {
         "trend-follower",
         "blueprint-scalper",
         "blueprint-mean-revert",
+        "blueprint-cluster-001",
+        "blueprint-cluster-002",
+        "blueprint-cluster-003",
+        "blueprint-cluster-004",
+        "blueprint-cluster-005",
+        "blueprint-cluster-006",
+        "blueprint-cluster-007",
+        "blueprint-cluster-008",
+        "blueprint-cluster-009",
+        "blueprint-cluster-010",
+        "blueprint-cluster-011",
+        "blueprint-cluster-012",
+        "blueprint-cluster-013",
+        "blueprint-cluster-014",
+        "blueprint-cluster-015",
+        "blueprint-cluster-016",
+        "blueprint-cluster-017",
+        "blueprint-cluster-018",
+        "blueprint-cluster-019",
+        "blueprint-cluster-020",
+        "blueprint-cluster-021",
+        "blueprint-cluster-022",
+        "blueprint-cluster-023",
+        "blueprint-cluster-024",
+        "blueprint-cluster-025",
+        "blueprint-cluster-026",
+        "blueprint-cluster-027",
+        "blueprint-cluster-028",
+        "blueprint-cluster-029",
+        "blueprint-cluster-030",
     ]
 }
 
@@ -2086,6 +2116,17 @@ pub fn create_strategy_from_config(
             };
             DataDrivenMeanRevertStrategy::from_params(bp_params)
                 .map(|s| Box::new(s) as Box<dyn Strategy>)
+        }
+        // Generic blueprint strategies: load from cluster JSON dynamically
+        s if s.starts_with("blueprint-cluster-") => {
+            let cluster_id = s.strip_prefix("blueprint-").unwrap();
+            match GenericBlueprintParams::from_cluster(cluster_id) {
+                Ok(params) => GenericBlueprintStrategy::from_params(cluster_id, params)
+                    .map(|s| Box::new(s) as Box<dyn Strategy>),
+                Err(e) => {
+                    anyhow::bail!("Failed to load blueprint for '{}': {}", cluster_id, e);
+                }
+            }
         }
         _ => {
             let available = available_strategies().join(", ");
@@ -2965,6 +3006,770 @@ impl Strategy for DataDrivenMeanRevertStrategy {
         } else {
             0.0
         };
+
+        let direction = if velocity_pct > 0.0 {
+            crate::signal::TradeDirection::Long
+        } else if velocity_pct < 0.0 {
+            crate::signal::TradeDirection::Short
+        } else {
+            crate::signal::TradeDirection::Neutral
+        };
+
+        MomentumSnapshot {
+            price_count: self.prices.len(),
+            current_price,
+            price_velocity_pct: velocity_pct,
+            direction,
+            strength: 0.0,
+            volatility_pct: 0.0,
+            pool_data: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generic Blueprint Strategy (handles any cluster blueprint)
+// ---------------------------------------------------------------------------
+
+/// Entry logic variant, selected by the `strategy_type` field in the blueprint.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+enum BlueprintEntryLogic {
+    /// Momentum velocity exceeding threshold (momentum_scalper)
+    Momentum,
+    /// SMA deviation + reversal confirmation (mean_reversion)
+    MeanReversion,
+    /// Breakout above threshold with confirmation ticks (trend_follower)
+    TrendBreakout,
+    /// Grid/oscillation: enter on small dips, exit on small bounces (grid)
+    Grid,
+}
+
+/// Parameters for the generic blueprint strategy.
+///
+/// Loads from any cluster blueprint JSON and selects entry logic based on
+/// `strategy_type`. All numeric parameters come directly from the blueprint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct GenericBlueprintParams {
+    // --- Source identification ---
+    pub source_cluster_id: String,
+    pub blueprint_path: String,
+    pub source_wallet_count: u64,
+    pub source_total_trades: u64,
+    pub confidence_score: f64,
+    pub primary_market: String,
+    pub direction_bias: String,
+    pub strategy_type: String,
+    pub entry_logic: BlueprintEntryLogic,
+
+    // --- Entry parameters ---
+    pub momentum_threshold_pct: f64,
+    pub lookback_count: usize,
+
+    // --- Mean reversion specific ---
+    pub mean_lookback: usize,
+    pub deviation_threshold_pct: f64,
+    pub reversal_confirmation_ticks: usize,
+    pub mean_tolerance_pct: f64,
+
+    // --- Trend follower specific ---
+    pub confirmation_ticks: usize,
+
+    // --- Exit parameters ---
+    pub take_profit_pct: f64,
+    pub stop_loss_pct: f64,
+    pub max_hold_secs: u64,
+    pub trailing_stop_pct: f64,
+    pub trailing_activation_pct: f64,
+
+    // --- Risk parameters ---
+    pub clip_size_usd: f64,
+    pub leverage: f64,
+    pub scale_in_clips: u32,
+    pub cooldown_after_loss_secs: u64,
+    pub use_native_tp_sl: bool,
+}
+
+impl GenericBlueprintParams {
+    /// Load parameters from any cluster blueprint by cluster ID.
+    pub fn from_cluster(cluster_id: &str) -> anyhow::Result<Self> {
+        let bp = load_blueprint(cluster_id)?;
+        Ok(Self::from_blueprint_data(&bp))
+    }
+
+    /// Build params from a pre-loaded BlueprintData.
+    pub fn from_blueprint_data(bp: &BlueprintData) -> Self {
+        let entry_logic = match bp.strategy_type.as_str() {
+            "momentum_scalper" => BlueprintEntryLogic::Momentum,
+            "mean_reversion" => BlueprintEntryLogic::MeanReversion,
+            "trend_follower" => BlueprintEntryLogic::TrendBreakout,
+            "grid" => BlueprintEntryLogic::Grid,
+            other => {
+                // Default to momentum for unknown types
+                warn!("Unknown strategy_type '{}', defaulting to Momentum", other);
+                BlueprintEntryLogic::Momentum
+            }
+        };
+
+        let direction_bias = match bp.direction.as_str() {
+            "long" => "long".to_string(),
+            "short" => "short".to_string(),
+            _ => "neutral".to_string(),
+        };
+
+        let lookback_count = (bp.entry_conditions.lookback_candles as usize) * 5;
+        let mean_lookback = (bp.entry_conditions.lookback_candles as usize) * 5;
+
+        Self {
+            source_cluster_id: bp.source_cluster_id.clone(),
+            blueprint_path: format!("data/blueprints/{}.json", bp.source_cluster_id),
+            source_wallet_count: bp.sample_size.wallets,
+            source_total_trades: bp.sample_size.total_trades,
+            confidence_score: bp.confidence_score,
+            primary_market: bp.primary_market.clone(),
+            direction_bias,
+            strategy_type: bp.strategy_type.clone(),
+            entry_logic,
+
+            momentum_threshold_pct: bp.entry_conditions.parameters.price_velocity_threshold,
+            lookback_count,
+
+            mean_lookback,
+            deviation_threshold_pct: bp.entry_conditions.parameters.price_velocity_threshold,
+            reversal_confirmation_ticks: 2,
+            mean_tolerance_pct: 0.3,
+
+            confirmation_ticks: 3,
+
+            take_profit_pct: bp.exit_conditions.take_profit_pct * 100.0,
+            stop_loss_pct: bp.exit_conditions.stop_loss_pct * 100.0,
+            max_hold_secs: (bp.exit_conditions.max_hold_hours * 3600.0) as u64,
+            trailing_stop_pct: if bp.exit_conditions.trailing_stop {
+                0.5
+            } else {
+                0.0
+            },
+            trailing_activation_pct: if bp.exit_conditions.trailing_stop {
+                0.3
+            } else {
+                0.0
+            },
+
+            clip_size_usd: bp.risk_parameters.clip_size_usd,
+            leverage: 3.0,
+            scale_in_clips: 1,
+            cooldown_after_loss_secs: 300,
+            use_native_tp_sl: true,
+        }
+    }
+
+    /// Validate parameters.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.clip_size_usd <= 0.0 {
+            return Err(format!(
+                "clip_size_usd must be > 0, got {}",
+                self.clip_size_usd
+            ));
+        }
+        if self.take_profit_pct <= 0.0 {
+            return Err(format!(
+                "take_profit_pct must be > 0, got {}",
+                self.take_profit_pct
+            ));
+        }
+        if self.stop_loss_pct <= 0.0 {
+            return Err(format!(
+                "stop_loss_pct must be > 0, got {}",
+                self.stop_loss_pct
+            ));
+        }
+        if self.max_hold_secs == 0 {
+            return Err("max_hold_secs must be > 0".to_string());
+        }
+        Ok(())
+    }
+
+    /// Convert to generic StrategyParams for engine/risk integration.
+    pub fn to_strategy_params(&self) -> StrategyParams {
+        StrategyParams {
+            direction_bias: self.direction_bias.clone(),
+            momentum_threshold_pct: self.momentum_threshold_pct,
+            lookback_count: self.lookback_count,
+            scale_in_clips: self.scale_in_clips,
+            clip_size_usd: self.clip_size_usd,
+            max_hold_secs: self.max_hold_secs,
+            take_profit_pct: self.take_profit_pct,
+            stop_loss_pct: self.stop_loss_pct,
+            trailing_stop_pct: self.trailing_stop_pct,
+            trailing_activation_pct: self.trailing_activation_pct,
+            cooldown_after_loss_secs: self.cooldown_after_loss_secs,
+            use_native_tp_sl: self.use_native_tp_sl,
+        }
+    }
+}
+
+/// Spike direction for mean-reversion and grid logic.
+#[derive(Debug, Clone, PartialEq)]
+enum GenericSpikeDirection {
+    Above,
+    Below,
+}
+
+/// Generic blueprint strategy that handles any cluster.
+///
+/// Selects entry logic based on the `strategy_type` field in the blueprint:
+/// - `momentum_scalper` → velocity-based entry
+/// - `mean_reversion` → SMA deviation + reversal
+/// - `trend_follower` → breakout with confirmation ticks
+/// - `grid` → oscillation around SMA
+///
+/// All exit logic (TP/SL/trailing/time stop) is shared across types.
+#[allow(dead_code)]
+pub struct GenericBlueprintStrategy {
+    params: GenericBlueprintParams,
+    generic_params: StrategyParams,
+    /// Strategy name (e.g., "blueprint-cluster-003")
+    name: String,
+    /// Rolling price buffer.
+    prices: VecDeque<crate::signal::PricePoint>,
+    /// SMA spike state (for mean-reversion and grid).
+    spike_state: Option<GenericSpikeDirection>,
+    /// Reversal tick counter (for mean-reversion).
+    reversal_ticks: usize,
+    /// Consecutive directional ticks (for trend follower confirmation).
+    consecutive_directional: usize,
+    /// Last direction seen for trend confirmation.
+    last_direction: Option<crate::signal::TradeDirection>,
+    /// Whether auto-scaling has been calibrated.
+    auto_scaled: bool,
+    /// Original velocity threshold from blueprint (before scaling).
+    original_velocity_threshold: f64,
+}
+
+impl GenericBlueprintStrategy {
+    /// Create from a cluster ID (e.g., "cluster-003").
+    pub fn from_cluster(cluster_id: &str) -> anyhow::Result<Self> {
+        let params = GenericBlueprintParams::from_cluster(cluster_id)?;
+        Self::from_params(cluster_id, params)
+    }
+
+    /// Create from explicit parameters.
+    pub fn from_params(cluster_id: &str, params: GenericBlueprintParams) -> anyhow::Result<Self> {
+        if let Err(e) = params.validate() {
+            anyhow::bail!("Invalid generic blueprint parameters: {}", e);
+        }
+        let generic = params.to_strategy_params();
+        let capacity = params.lookback_count.max(params.mean_lookback) * 2;
+        let name = format!("blueprint-{}", cluster_id);
+        let original_velocity_threshold = params.momentum_threshold_pct;
+        Ok(Self {
+            params,
+            generic_params: generic,
+            name,
+            prices: VecDeque::with_capacity(capacity),
+            spike_state: None,
+            reversal_ticks: 0,
+            consecutive_directional: 0,
+            last_direction: None,
+            auto_scaled: false,
+            original_velocity_threshold,
+        })
+    }
+
+    /// Return a reference to the blueprint params.
+    #[allow(dead_code)]
+    pub fn blueprint_params(&self) -> &GenericBlueprintParams {
+        &self.params
+    }
+
+    /// Compute SMA over last N prices.
+    fn compute_sma(&self, lookback: usize) -> Option<f64> {
+        if self.prices.len() < lookback {
+            return None;
+        }
+        let sum: f64 = self
+            .prices
+            .iter()
+            .rev()
+            .take(lookback)
+            .map(|p| p.price)
+            .sum();
+        Some(sum / lookback as f64)
+    }
+
+    fn prev_price(&self) -> Option<f64> {
+        self.prices.iter().rev().nth(1).map(|p| p.price)
+    }
+
+    fn current_price(&self) -> Option<f64> {
+        self.prices.back().map(|p| p.price)
+    }
+
+    /// Velocity over the last N prices (pct change).
+    fn compute_velocity(&self) -> f64 {
+        let n = self.params.lookback_count;
+        if self.prices.len() < n || n == 0 {
+            return 0.0;
+        }
+        let prices: Vec<f64> = self.prices.iter().rev().take(n).map(|p| p.price).collect();
+        let oldest = *prices.last().unwrap();
+        let newest = prices[0];
+        if oldest <= 0.0 {
+            return 0.0;
+        }
+        (newest - oldest) / oldest * 100.0
+    }
+
+    /// Auto-scale velocity threshold based on actual market volatility.
+    ///
+    /// Strategy: measure the median absolute velocity over the lookback window.
+    /// The threshold should be calibrated so that signals fire at approximately
+    /// the same percentile of price movements as in the source market.
+    ///
+    /// We aim for the threshold to be at the 90th percentile of absolute velocity.
+    /// If the current threshold is unreachable (>99th percentile) or too easy (<50th),
+    /// we scale it to the 90th percentile of observed velocities.
+    fn auto_scale_threshold(&mut self) {
+        let lookback = self.params.lookback_count;
+        if self.prices.len() < lookback * 2 {
+            return;
+        }
+
+        // Compute absolute velocity for each window position
+        let prices: Vec<f64> = self.prices.iter().map(|p| p.price).collect();
+        let mut velocities: Vec<f64> = Vec::new();
+        for i in lookback..prices.len() {
+            let oldest = prices[i - lookback];
+            let newest = prices[i];
+            if oldest > 0.0 {
+                velocities.push(((newest - oldest) / oldest * 100.0).abs());
+            }
+        }
+
+        if velocities.len() < 10 {
+            return;
+        }
+
+        velocities.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        // Check where the original threshold falls in the distribution
+        let threshold = self.original_velocity_threshold;
+        let above_count = velocities.iter().filter(|&&v| v >= threshold).count();
+        let percentile = above_count as f64 / velocities.len() as f64 * 100.0;
+
+        // Only scale if threshold is in extreme percentiles
+        // Target: 85th-95th percentile (fires on ~10% of windows)
+        if percentile > 1.0 && percentile < 99.0 {
+            // Threshold is reachable, don't scale
+            self.auto_scaled = true;
+            return;
+        }
+
+        // Set threshold to 90th percentile of observed velocities
+        let p90_idx = (velocities.len() as f64 * 0.90) as usize;
+        let p90 = velocities[p90_idx.min(velocities.len() - 1)];
+
+        if p90 > 0.0 {
+            let ratio = p90 / threshold;
+            // Only apply if scale factor is significant
+            if ratio > 1.5 || ratio < 0.67 {
+                info!(
+                    "[{}] Auto-scaling velocity: {:.3}% → {:.3}% (p90 of {} velocities, original at p{:.0})",
+                    self.name,
+                    threshold,
+                    p90,
+                    velocities.len(),
+                    percentile
+                );
+                self.params.momentum_threshold_pct = p90;
+                if self.params.entry_logic == BlueprintEntryLogic::MeanReversion
+                    || self.params.entry_logic == BlueprintEntryLogic::Grid
+                {
+                    self.params.deviation_threshold_pct = p90;
+                }
+            }
+        }
+        self.auto_scaled = true;
+    }
+
+    // --- Entry detectors per strategy type ---
+
+    fn entry_momentum(&mut self) -> Signal {
+        if self.prices.len() < self.params.lookback_count {
+            return Signal::NoSignal;
+        }
+
+        let velocity_pct = self.compute_velocity();
+        let strength =
+            (velocity_pct.abs() / self.params.momentum_threshold_pct * 50.0).clamp(50.0, 100.0);
+
+        match self.params.direction_bias.as_str() {
+            "long" => {
+                if velocity_pct > self.params.momentum_threshold_pct {
+                    info!(
+                        "[{}] LONG signal: velocity={:.3}%, threshold={:.3}%",
+                        self.name, velocity_pct, self.params.momentum_threshold_pct
+                    );
+                    return Signal::MomentumLong {
+                        strength,
+                        velocity_pct,
+                    };
+                }
+            }
+            "short" => {
+                if velocity_pct < -self.params.momentum_threshold_pct {
+                    info!(
+                        "[{}] SHORT signal: velocity={:.3}%, threshold={:.3}%",
+                        self.name, velocity_pct, self.params.momentum_threshold_pct
+                    );
+                    return Signal::MomentumShort {
+                        strength,
+                        velocity_pct,
+                    };
+                }
+            }
+            _ => {
+                if velocity_pct > self.params.momentum_threshold_pct {
+                    return Signal::MomentumLong {
+                        strength,
+                        velocity_pct,
+                    };
+                }
+                if velocity_pct < -self.params.momentum_threshold_pct {
+                    return Signal::MomentumShort {
+                        strength,
+                        velocity_pct,
+                    };
+                }
+            }
+        }
+        Signal::NoSignal
+    }
+
+    fn entry_mean_reversion(&mut self) -> Signal {
+        let current_price = match self.current_price() {
+            Some(p) => p,
+            None => return Signal::NoSignal,
+        };
+
+        let sma = match self.compute_sma(self.params.mean_lookback) {
+            Some(s) => s,
+            None => return Signal::NoSignal,
+        };
+
+        if sma <= 0.0 {
+            return Signal::NoSignal;
+        }
+
+        let deviation_pct = (current_price - sma) / sma * 100.0;
+
+        // Spike detection
+        if deviation_pct > self.params.deviation_threshold_pct {
+            if self.spike_state != Some(GenericSpikeDirection::Above) {
+                self.spike_state = Some(GenericSpikeDirection::Above);
+                self.reversal_ticks = 0;
+            }
+        } else if deviation_pct < -self.params.deviation_threshold_pct {
+            if self.spike_state != Some(GenericSpikeDirection::Below) {
+                self.spike_state = Some(GenericSpikeDirection::Below);
+                self.reversal_ticks = 0;
+            }
+        }
+
+        if let Some(ref spike_dir) = self.spike_state {
+            let prev_price = match self.prev_price() {
+                Some(p) => p,
+                None => return Signal::NoSignal,
+            };
+
+            let moving_toward_mean = match spike_dir {
+                GenericSpikeDirection::Above => current_price < prev_price,
+                GenericSpikeDirection::Below => current_price > prev_price,
+            };
+
+            if moving_toward_mean {
+                self.reversal_ticks += 1;
+                if self.reversal_ticks >= self.params.reversal_confirmation_ticks {
+                    let strength = (deviation_pct.abs() / self.params.deviation_threshold_pct
+                        * 50.0)
+                        .clamp(50.0, 100.0);
+                    let velocity_pct = deviation_pct.abs();
+                    let dir_clone = spike_dir.clone();
+                    self.spike_state = None;
+                    self.reversal_ticks = 0;
+
+                    match dir_clone {
+                        GenericSpikeDirection::Above => {
+                            info!("[{}] MR SHORT: dev={:.2}%", self.name, deviation_pct);
+                            Signal::MomentumShort {
+                                strength,
+                                velocity_pct,
+                            }
+                        }
+                        GenericSpikeDirection::Below => {
+                            info!("[{}] MR LONG: dev={:.2}%", self.name, deviation_pct);
+                            Signal::MomentumLong {
+                                strength,
+                                velocity_pct,
+                            }
+                        }
+                    }
+                } else {
+                    Signal::NoSignal
+                }
+            } else {
+                if deviation_pct.abs() <= self.params.deviation_threshold_pct {
+                    self.spike_state = None;
+                    self.reversal_ticks = 0;
+                }
+                Signal::NoSignal
+            }
+        } else {
+            Signal::NoSignal
+        }
+    }
+
+    fn entry_trend_breakout(&mut self) -> Signal {
+        if self.prices.len() < self.params.lookback_count {
+            return Signal::NoSignal;
+        }
+
+        let velocity_pct = self.compute_velocity();
+
+        // Track consecutive directional ticks
+        let current_dir = if velocity_pct > 0.0 {
+            crate::signal::TradeDirection::Long
+        } else if velocity_pct < 0.0 {
+            crate::signal::TradeDirection::Short
+        } else {
+            crate::signal::TradeDirection::Neutral
+        };
+
+        match (&self.last_direction, &current_dir) {
+            (Some(last), curr)
+                if last == curr && *curr != crate::signal::TradeDirection::Neutral =>
+            {
+                self.consecutive_directional += 1;
+            }
+            _ => {
+                self.consecutive_directional = 1;
+            }
+        }
+        self.last_direction = Some(current_dir.clone());
+
+        // Need enough consecutive ticks AND velocity above threshold
+        if self.consecutive_directional >= self.params.confirmation_ticks
+            && velocity_pct.abs() > self.params.momentum_threshold_pct
+        {
+            let strength =
+                (velocity_pct.abs() / self.params.momentum_threshold_pct * 50.0).clamp(50.0, 100.0);
+
+            self.consecutive_directional = 0;
+            self.last_direction = None;
+
+            match (current_dir, self.params.direction_bias.as_str()) {
+                (crate::signal::TradeDirection::Long, "short") => Signal::NoSignal,
+                (crate::signal::TradeDirection::Short, "long") => Signal::NoSignal,
+                (crate::signal::TradeDirection::Long, _) => {
+                    info!(
+                        "[{}] TREND LONG: velocity={:.3}%, consec={}",
+                        self.name, velocity_pct, self.params.confirmation_ticks
+                    );
+                    Signal::MomentumLong {
+                        strength,
+                        velocity_pct,
+                    }
+                }
+                (crate::signal::TradeDirection::Short, _) => {
+                    info!(
+                        "[{}] TREND SHORT: velocity={:.3}%, consec={}",
+                        self.name, velocity_pct, self.params.confirmation_ticks
+                    );
+                    Signal::MomentumShort {
+                        strength,
+                        velocity_pct,
+                    }
+                }
+                _ => Signal::NoSignal,
+            }
+        } else {
+            Signal::NoSignal
+        }
+    }
+
+    fn entry_grid(&mut self) -> Signal {
+        let current_price = match self.current_price() {
+            Some(p) => p,
+            None => return Signal::NoSignal,
+        };
+
+        let sma = match self.compute_sma(self.params.mean_lookback) {
+            Some(s) => s,
+            None => return Signal::NoSignal,
+        };
+
+        if sma <= 0.0 {
+            return Signal::NoSignal;
+        }
+
+        let deviation_pct = (current_price - sma) / sma * 100.0;
+
+        // Grid: enter when price dips below lower band, direction neutral (buy dips, sell rips)
+        if deviation_pct < -self.params.deviation_threshold_pct {
+            let strength = (deviation_pct.abs() / self.params.deviation_threshold_pct * 50.0)
+                .clamp(50.0, 100.0);
+            let velocity_pct = deviation_pct.abs();
+            info!("[{}] GRID LONG: dev={:.2}%", self.name, deviation_pct);
+            Signal::MomentumLong {
+                strength,
+                velocity_pct,
+            }
+        } else if deviation_pct > self.params.deviation_threshold_pct {
+            let strength = (deviation_pct.abs() / self.params.deviation_threshold_pct * 50.0)
+                .clamp(50.0, 100.0);
+            let velocity_pct = deviation_pct.abs();
+            info!("[{}] GRID SHORT: dev={:.2}%", self.name, deviation_pct);
+            Signal::MomentumShort {
+                strength,
+                velocity_pct,
+            }
+        } else {
+            Signal::NoSignal
+        }
+    }
+}
+
+impl Strategy for GenericBlueprintStrategy {
+    fn name(&self) -> &str {
+        // Leak the name string to get a 'static &str. This is fine since
+        // strategy names are created once and live for the process lifetime.
+        let name = self.name.clone();
+        Box::leak(name.into_boxed_str())
+    }
+
+    fn detect_entry(&mut self, _snapshot: &MomentumSnapshot) -> Signal {
+        match self.params.entry_logic {
+            BlueprintEntryLogic::Momentum => self.entry_momentum(),
+            BlueprintEntryLogic::MeanReversion => self.entry_mean_reversion(),
+            BlueprintEntryLogic::TrendBreakout => self.entry_trend_breakout(),
+            BlueprintEntryLogic::Grid => self.entry_grid(),
+        }
+    }
+
+    fn detect_exit(&self, _snapshot: &MomentumSnapshot, ctx: &PositionContext) -> Option<Signal> {
+        let current_price = ctx.current_price;
+        let pnl_pct = if ctx.is_long {
+            (current_price - ctx.entry_price) / ctx.entry_price * 100.0
+        } else {
+            (ctx.entry_price - current_price) / ctx.entry_price * 100.0
+        };
+
+        // 1. Stop loss
+        if pnl_pct <= -ctx.stop_loss_pct {
+            warn!("[{}] STOP LOSS: pnl={:.2}%", self.name, pnl_pct);
+            return Some(exit_signal(
+                ctx.is_long,
+                crate::signal::ExitReason::StopLoss,
+            ));
+        }
+
+        // 2. Take profit
+        if pnl_pct >= ctx.take_profit_pct {
+            info!("[{}] TAKE PROFIT: pnl={:.2}%", self.name, pnl_pct);
+            return Some(exit_signal(
+                ctx.is_long,
+                crate::signal::ExitReason::TakeProfit,
+            ));
+        }
+
+        // 3. Trailing stop
+        if ctx.trailing_stop_pct > 0.0 && ctx.trailing_activation_pct > 0.0 {
+            let activation_threshold = ctx.entry_price
+                * (1.0
+                    + ctx.trailing_activation_pct / 100.0 * if ctx.is_long { 1.0 } else { -1.0 });
+            let activated = if ctx.is_long {
+                ctx.peak_price >= activation_threshold
+            } else {
+                ctx.peak_price <= activation_threshold
+            };
+
+            if activated {
+                let retrace_pct = if ctx.is_long {
+                    (ctx.peak_price - current_price) / ctx.peak_price * 100.0
+                } else {
+                    (current_price - ctx.peak_price) / ctx.peak_price * 100.0
+                };
+                if retrace_pct >= ctx.trailing_stop_pct {
+                    info!(
+                        "[{}] TRAILING STOP: retrace={:.2}%, threshold={:.2}%",
+                        self.name, retrace_pct, ctx.trailing_stop_pct
+                    );
+                    return Some(exit_signal(
+                        ctx.is_long,
+                        crate::signal::ExitReason::TrailingStop,
+                    ));
+                }
+            }
+        }
+
+        // 4. Time stop
+        if ctx.hold_secs >= ctx.max_hold_secs {
+            warn!(
+                "[{}] TIME STOP: held {}s, max={}s",
+                self.name, ctx.hold_secs, ctx.max_hold_secs
+            );
+            return Some(exit_signal(
+                ctx.is_long,
+                crate::signal::ExitReason::TimeStop,
+            ));
+        }
+
+        // 5. Mean return exit (for mean_reversion and grid types)
+        if self.params.entry_logic == BlueprintEntryLogic::MeanReversion
+            || self.params.entry_logic == BlueprintEntryLogic::Grid
+        {
+            if let Some(sma) = self.compute_sma(self.params.mean_lookback) {
+                if sma > 0.0 {
+                    let deviation_from_mean = (current_price - sma).abs() / sma * 100.0;
+                    if deviation_from_mean <= self.params.mean_tolerance_pct {
+                        info!(
+                            "[{}] MEAN RETURN: price={:.2}, sma={:.2}, dev={:.2}%",
+                            self.name, current_price, sma, deviation_from_mean
+                        );
+                        return Some(exit_signal(
+                            ctx.is_long,
+                            crate::signal::ExitReason::TakeProfit,
+                        ));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn parameters(&self) -> &StrategyParams {
+        &self.generic_params
+    }
+
+    fn push_price(&mut self, price: f64, timestamp_ms: i64) {
+        self.prices.push_back(crate::signal::PricePoint {
+            price,
+            timestamp_ms,
+        });
+        let max_len = self.params.lookback_count.max(self.params.mean_lookback) * 2;
+        while self.prices.len() > max_len {
+            self.prices.pop_front();
+        }
+        // Auto-scale threshold once we have enough data (and haven't scaled yet)
+        if !self.auto_scaled && self.prices.len() >= self.params.lookback_count {
+            self.auto_scale_threshold();
+        }
+    }
+
+    fn snapshot(&self) -> MomentumSnapshot {
+        let current_price = self.current_price().unwrap_or(0.0);
+        let velocity_pct = self.compute_velocity();
 
         let direction = if velocity_pct > 0.0 {
             crate::signal::TradeDirection::Long
@@ -5250,5 +6055,251 @@ mod tests {
         assert!((params.take_profit_pct - 0.4284).abs() < 0.01);
         assert!((params.stop_loss_pct - 0.2879).abs() < 0.01);
         assert!((params.clip_size_usd - 116.6).abs() < 0.1);
+    }
+
+    // ===== Generic Blueprint Strategy Tests =====
+
+    #[test]
+    fn test_generic_blueprint_loads_all_clusters() {
+        for cluster_id in &[
+            "cluster-002",
+            "cluster-003",
+            "cluster-005",
+            "cluster-006",
+            "cluster-007",
+            "cluster-008",
+            "cluster-009",
+        ] {
+            let params = GenericBlueprintParams::from_cluster(cluster_id)
+                .unwrap_or_else(|e| panic!("Failed to load {}: {}", cluster_id, e));
+            assert_eq!(params.source_cluster_id, *cluster_id);
+            assert!(
+                params.clip_size_usd > 0.0,
+                "{} clip_size_usd={}",
+                cluster_id,
+                params.clip_size_usd
+            );
+            assert!(
+                params.take_profit_pct > 0.0,
+                "{} take_profit_pct={}",
+                cluster_id,
+                params.take_profit_pct
+            );
+            assert!(
+                params.stop_loss_pct > 0.0,
+                "{} stop_loss_pct={}",
+                cluster_id,
+                params.stop_loss_pct
+            );
+            assert!(
+                params.max_hold_secs > 0,
+                "{} max_hold_secs={}",
+                cluster_id,
+                params.max_hold_secs
+            );
+        }
+    }
+
+    #[test]
+    fn test_generic_blueprint_strategy_names() {
+        for cluster_id in &[
+            "cluster-002",
+            "cluster-003",
+            "cluster-005",
+            "cluster-006",
+            "cluster-007",
+            "cluster-008",
+            "cluster-009",
+        ] {
+            let strategy = GenericBlueprintStrategy::from_cluster(cluster_id).unwrap();
+            let name = strategy.name();
+            assert!(name.starts_with("blueprint-cluster-"), "name={}", name);
+        }
+    }
+
+    #[test]
+    fn test_generic_blueprint_factory_creates_strategies() {
+        for name in &[
+            "blueprint-cluster-002",
+            "blueprint-cluster-003",
+            "blueprint-cluster-005",
+            "blueprint-cluster-006",
+            "blueprint-cluster-007",
+            "blueprint-cluster-008",
+            "blueprint-cluster-009",
+        ] {
+            let strategy = create_strategy_from_config(name, None, default_params())
+                .unwrap_or_else(|e| panic!("Failed to create {}: {}", name, e));
+            assert_eq!(strategy.name(), *name);
+        }
+    }
+
+    #[test]
+    fn test_generic_blueprint_cluster_002_entry_logic_is_grid() {
+        let params = GenericBlueprintParams::from_cluster("cluster-002").unwrap();
+        assert_eq!(params.entry_logic, BlueprintEntryLogic::Grid);
+        assert_eq!(params.strategy_type, "grid");
+    }
+
+    #[test]
+    fn test_generic_blueprint_cluster_005_entry_logic_is_momentum() {
+        let params = GenericBlueprintParams::from_cluster("cluster-005").unwrap();
+        assert_eq!(params.entry_logic, BlueprintEntryLogic::Momentum);
+        assert_eq!(params.strategy_type, "momentum_scalper");
+    }
+
+    #[test]
+    fn test_generic_blueprint_cluster_006_entry_logic_is_trend() {
+        let params = GenericBlueprintParams::from_cluster("cluster-006").unwrap();
+        assert_eq!(params.entry_logic, BlueprintEntryLogic::TrendBreakout);
+        assert_eq!(params.strategy_type, "trend_follower");
+    }
+
+    #[test]
+    fn test_generic_blueprint_cluster_003_direction_long() {
+        let params = GenericBlueprintParams::from_cluster("cluster-003").unwrap();
+        assert_eq!(params.direction_bias, "long");
+    }
+
+    #[test]
+    fn test_generic_blueprint_cluster_005_direction_short() {
+        let params = GenericBlueprintParams::from_cluster("cluster-005").unwrap();
+        assert_eq!(params.direction_bias, "short");
+    }
+
+    #[test]
+    fn test_generic_blueprint_cluster_007_direction_neutral() {
+        let params = GenericBlueprintParams::from_cluster("cluster-007").unwrap();
+        assert_eq!(params.direction_bias, "neutral");
+    }
+
+    #[test]
+    fn test_generic_blueprint_grid_entry_signal() {
+        let mut strategy = GenericBlueprintStrategy::from_cluster("cluster-002").unwrap();
+        // Feed prices that create SMA deviation exceeding threshold
+        let base_ts = 1000000_i64;
+        let base_price = 100.0;
+        // Feed enough prices to fill the lookback
+        for i in 0..40 {
+            strategy.push_price(base_price, base_ts + i * 1000);
+        }
+        // Now push a price far above SMA to trigger grid short
+        strategy.push_price(base_price * 1.05, base_ts + 40 * 1000);
+        let snap = strategy.snapshot();
+        let signal = strategy.detect_entry(&snap);
+        // Grid should detect the deviation and signal
+        assert!(
+            matches!(signal, Signal::MomentumShort { .. }),
+            "Grid should signal short on upward deviation: {:?}",
+            signal
+        );
+    }
+
+    #[test]
+    fn test_generic_blueprint_momentum_entry_signal() {
+        let mut strategy = GenericBlueprintStrategy::from_cluster("cluster-005").unwrap();
+        let base_ts = 1000000_i64;
+        // Feed falling prices to trigger short (cluster-005 is short-biased)
+        let start = 100.0;
+        for i in 0..40 {
+            let price = start * (1.0 - 0.01 * (i as f64));
+            strategy.push_price(price, base_ts + i * 1000);
+        }
+        let snap = strategy.snapshot();
+        let signal = strategy.detect_entry(&snap);
+        assert!(
+            matches!(signal, Signal::MomentumShort { .. }),
+            "Momentum scalper should detect short: {:?}",
+            signal
+        );
+    }
+
+    #[test]
+    fn test_generic_blueprint_exit_on_stop_loss() {
+        let mut strategy = GenericBlueprintStrategy::from_cluster("cluster-003").unwrap();
+        for i in 0..40 {
+            strategy.push_price(100.0, 1000000 + i * 1000);
+        }
+        let params = strategy.blueprint_params();
+        let ctx = PositionContext {
+            is_long: true,
+            entry_price: 100.0,
+            current_price: 90.0, // 10% drop = stop loss
+            peak_price: 100.0,
+            hold_secs: 100,
+            max_hold_secs: params.max_hold_secs,
+            take_profit_pct: params.take_profit_pct,
+            stop_loss_pct: params.stop_loss_pct,
+            trailing_stop_pct: params.trailing_stop_pct,
+            trailing_activation_pct: params.trailing_activation_pct,
+        };
+        let snap = strategy.snapshot();
+        let exit = strategy.detect_exit(&snap, &ctx);
+        assert!(exit.is_some(), "Should fire stop loss");
+    }
+
+    #[test]
+    fn test_generic_blueprint_exit_on_take_profit() {
+        let mut strategy = GenericBlueprintStrategy::from_cluster("cluster-009").unwrap();
+        for i in 0..40 {
+            strategy.push_price(100.0, 1000000 + i * 1000);
+        }
+        let params = strategy.blueprint_params();
+        let ctx = PositionContext {
+            is_long: true,
+            entry_price: 100.0,
+            current_price: 105.0, // 5% gain = take profit
+            peak_price: 105.0,
+            hold_secs: 100,
+            max_hold_secs: params.max_hold_secs,
+            take_profit_pct: params.take_profit_pct,
+            stop_loss_pct: params.stop_loss_pct,
+            trailing_stop_pct: params.trailing_stop_pct,
+            trailing_activation_pct: params.trailing_activation_pct,
+        };
+        let snap = strategy.snapshot();
+        let exit = strategy.detect_exit(&snap, &ctx);
+        assert!(exit.is_some(), "Should fire take profit");
+    }
+
+    #[test]
+    fn test_generic_blueprint_available_in_strategies_list() {
+        let strategies = available_strategies();
+        for name in &[
+            "blueprint-cluster-002",
+            "blueprint-cluster-003",
+            "blueprint-cluster-005",
+            "blueprint-cluster-006",
+            "blueprint-cluster-007",
+            "blueprint-cluster-008",
+            "blueprint-cluster-009",
+        ] {
+            assert!(
+                strategies.contains(name),
+                "{} should be in available_strategies",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_generic_blueprint_params_validate() {
+        for cluster_id in &[
+            "cluster-002",
+            "cluster-003",
+            "cluster-005",
+            "cluster-006",
+            "cluster-007",
+            "cluster-008",
+            "cluster-009",
+        ] {
+            let params = GenericBlueprintParams::from_cluster(cluster_id).unwrap();
+            assert!(
+                params.validate().is_ok(),
+                "{} should validate: {:?}",
+                cluster_id,
+                params.validate()
+            );
+        }
     }
 }

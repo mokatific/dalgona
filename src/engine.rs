@@ -65,7 +65,7 @@ impl ScalperEngine {
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
-        info!("=== Flash Trade Perps Scalper v1.0 ===");
+        info!("=== Flash Trade Perps Scalper v0.2.0 ===");
         info!("Market: {}", self.config.flash.market);
         info!("Leverage: {}x", self.config.flash.leverage);
         info!("Clip: ${:.0}", self.config.strategy.clip_size_usd);

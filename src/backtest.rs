@@ -555,25 +555,83 @@ impl BacktestEngine {
         };
 
         let mut trades = Vec::new();
-        let mut trade_pnls: Vec<f64> = Vec::new();
         let mut cell_balance = self.bt_config.starting_balance;
-        let mut peak_balance = cell_balance;
+        let mut max_equity = cell_balance;
         let mut cooldown_until_ms: i64 = 0;
 
+        // Equity curve (one sample per candle) — drives mid-position drawdown
+        // tracking and the annualized Sharpe calculation below.
+        let mut equity_curve: Vec<f64> = Vec::with_capacity(candles.len() + 1);
+        equity_curve.push(cell_balance);
+
+        // Pending entry signal from the previous candle's close. Filled at
+        // *this* candle's open to avoid lookahead bias (signal computed using
+        // close(N) must not also fill at close(N)).
+        let mut pending_entry: Option<bool> = None;
+
+        let bias = params.direction_bias.to_lowercase();
+        // Fees on Flash perps are charged on the levered notional, not on the
+        // collateral. The previous version multiplied by `clip_size_usd` only
+        // and so under-counted fees by the leverage factor.
+        let fee_notional_factor = self.bt_config.leverage.max(1.0);
+        let lockout_ticks: i64 = 6;
+        let lockout_ms = lockout_ticks * interval_ms;
+
         for candle in candles {
+            let open_price: f64 = candle.o.parse().unwrap_or(0.0);
+            let high_price: f64 = candle.h.parse().unwrap_or(0.0);
+            let low_price: f64 = candle.l.parse().unwrap_or(0.0);
             let close_price: f64 = candle.c.parse().unwrap_or(0.0);
-            if close_price <= 0.0 {
+            if close_price <= 0.0 || open_price <= 0.0 || high_price <= 0.0 || low_price <= 0.0 {
                 continue;
             }
 
-            // Feed close price to strategy
-            strat.push_price(close_price, candle.t);
+            // 1) Fill any pending entry queued from the previous candle's
+            //    close-based signal at THIS candle's open. This is the
+            //    realistic execution model: signal at bar close → order
+            //    queued → fills at next bar open.
+            if position.is_none() {
+                if let Some(is_long) = pending_entry.take() {
+                    let clip = params.clip_size_usd;
+                    let notional = clip * fee_notional_factor;
+                    let entry_fee = notional * self.bt_config.fee_rate;
+                    position = Some(BtPosition {
+                        symbol: market.to_string(),
+                        is_long,
+                        entry_price: open_price,
+                        current_price: open_price,
+                        peak_price: open_price,
+                        size_usd: clip,
+                        leverage: self.bt_config.leverage,
+                        open_time_ms: candle.t,
+                        entry_fee,
+                        accrued_borrow_fee: 0.0,
+                        borrow_rate_hourly: self.bt_config.borrow_rate_hourly,
+                    });
+                    debug!(
+                        "[BT] {} {} {} @ ${:.4} (next-open fill)",
+                        strategy_name,
+                        if is_long { "LONG" } else { "SHORT" },
+                        market,
+                        open_price
+                    );
+                }
+            } else {
+                // Already have a position; cancel any stale pending entry.
+                pending_entry = None;
+            }
 
-            // Build snapshot for signal detection
+            // 2) Feed the close into the strategy for signal evaluation.
+            strat.push_price(close_price, candle.t);
             let snapshot = strat.snapshot();
 
-            // Check exit first (if we have a position)
+            // 3) Manage existing position
             if position.is_some() {
+                // Accrue borrow + update peak — exactly once per candle.
+                if let Some(ref mut pos_mut) = position {
+                    pos_mut.update_price(close_price, interval_secs);
+                }
+
                 let (is_long, entry_price, peak_price, hold_secs) = {
                     let pos = position.as_ref().unwrap();
                     (
@@ -583,62 +641,69 @@ impl BacktestEngine {
                         pos.hold_secs(candle.t),
                     )
                 };
-                let context = PositionContext {
+
+                // 3a) Intra-candle TP/SL check. These price-based exits fill
+                //     at the trigger level (not close), and SL takes priority
+                //     over TP when both are touched.
+                let intra = intra_candle_tp_sl_hit(
                     is_long,
                     entry_price,
-                    current_price: close_price,
-                    peak_price,
-                    hold_secs,
-                    max_hold_secs: params.max_hold_secs,
-                    take_profit_pct: params.take_profit_pct,
-                    stop_loss_pct: params.stop_loss_pct,
-                    trailing_stop_pct: params.trailing_stop_pct,
-                    trailing_activation_pct: params.trailing_activation_pct,
+                    params.take_profit_pct,
+                    params.stop_loss_pct,
+                    low_price,
+                    high_price,
+                );
+
+                // 3b) For non-price exits (time stop, momentum lost, reversal
+                //     detection, trailing stop) consult the strategy. These
+                //     fill at the bar's close.
+                let strat_exit = if intra.is_none() {
+                    let context = PositionContext {
+                        is_long,
+                        entry_price,
+                        current_price: close_price,
+                        peak_price,
+                        hold_secs,
+                        max_hold_secs: params.max_hold_secs,
+                        take_profit_pct: params.take_profit_pct,
+                        stop_loss_pct: params.stop_loss_pct,
+                        trailing_stop_pct: params.trailing_stop_pct,
+                        trailing_activation_pct: params.trailing_activation_pct,
+                    };
+                    strat.detect_exit(&snapshot, &context)
+                } else {
+                    None
                 };
 
-                let exit_signal = strat.detect_exit(&snapshot, &context);
-
-                // Update price
-                if let Some(ref mut pos_mut) = position {
-                    pos_mut.update_price(close_price, interval_secs);
-                }
-
-                let should_exit = match exit_signal {
-                    Some(Signal::ExitLong { .. }) if is_long => true,
-                    Some(Signal::ExitShort { .. }) if !is_long => true,
-                    _ => false,
+                let (exit_reason_enum, fill_price): (Option<ExitReason>, f64) = match (intra, strat_exit) {
+                    (Some((reason, px)), _) => (Some(reason), px),
+                    (None, Some(Signal::ExitLong { reason })) if is_long => (Some(reason), close_price),
+                    (None, Some(Signal::ExitShort { reason })) if !is_long => (Some(reason), close_price),
+                    _ => (None, close_price),
                 };
 
-                if should_exit {
+                if let Some(reason) = exit_reason_enum {
                     let pos = position.take().unwrap();
-                    let exit_fee = pos.size_usd * self.bt_config.fee_rate;
-                    let gross_pnl = pos.unrealized_pnl_usd();
+                    let exit_notional = pos.size_usd * fee_notional_factor;
+                    let exit_fee = exit_notional * self.bt_config.fee_rate;
+                    let gross_pnl = if pos.is_long {
+                        pos.size_usd * (fill_price - pos.entry_price) / pos.entry_price
+                    } else {
+                        pos.size_usd * (pos.entry_price - fill_price) / pos.entry_price
+                    };
                     let total_fees = pos.entry_fee + exit_fee + pos.accrued_borrow_fee;
                     let net_pnl = gross_pnl - exit_fee - pos.accrued_borrow_fee;
 
-                    // Determine exit reason
-                    let exit_reason = match exit_signal {
-                        Some(Signal::ExitLong { reason }) | Some(Signal::ExitShort { reason }) => {
-                            match reason {
-                                ExitReason::StopLoss => "stop_loss",
-                                ExitReason::TakeProfit => "take_profit",
-                                ExitReason::TrailingStop => "trailing_stop",
-                                ExitReason::TimeStop => "time_stop",
-                                ExitReason::MomentumLost => "momentum_lost",
-                                ExitReason::ReversalDetected => "reversal",
-                            }
-                        }
-                        _ => "unknown",
+                    let exit_reason_str = match reason {
+                        ExitReason::StopLoss => "stop_loss",
+                        ExitReason::TakeProfit => "take_profit",
+                        ExitReason::TrailingStop => "trailing_stop",
+                        ExitReason::TimeStop => "time_stop",
+                        ExitReason::MomentumLost => "momentum_lost",
+                        ExitReason::ReversalDetected => "reversal",
                     };
 
                     cell_balance += net_pnl;
-                    if cell_balance > peak_balance {
-                        peak_balance = cell_balance;
-                    }
-                    let drawdown = peak_balance - cell_balance;
-                    if drawdown > stats.max_drawdown_usd {
-                        stats.max_drawdown_usd = drawdown;
-                    }
 
                     stats.trade_count += 1;
                     stats.gross_pnl += gross_pnl;
@@ -647,17 +712,12 @@ impl BacktestEngine {
                     stats.exit_fees_total += exit_fee;
                     stats.borrow_fees_total += pos.accrued_borrow_fee;
                     stats.net_pnl += net_pnl;
-                    trade_pnls.push(net_pnl);
 
                     if net_pnl >= 0.0 {
                         stats.win_count += 1;
                     } else {
                         stats.loss_count += 1;
                     }
-                    // Post-exit lockout: don't re-enter for at least N bars after any exit.
-                    // This prevents the exit→re-enter→exit→re-enter death spiral.
-                    let lockout_ticks = 6; // 6 bars = 30 min at 5m interval
-                    let lockout_ms = lockout_ticks * interval_ms;
                     cooldown_until_ms = candle.t + lockout_ms;
 
                     if net_pnl > stats.best_trade_pnl {
@@ -667,13 +727,12 @@ impl BacktestEngine {
                         stats.worst_trade_pnl = net_pnl;
                     }
 
-                    let hold_secs = pos.hold_secs(candle.t);
+                    let exit_hold_secs = pos.hold_secs(candle.t);
                     stats.avg_hold_secs = if stats.trade_count == 1 {
-                        hold_secs as f64
+                        exit_hold_secs as f64
                     } else {
-                        // Running average
                         let prev_total = stats.avg_hold_secs * (stats.trade_count - 1) as f64;
-                        (prev_total + hold_secs as f64) / stats.trade_count as f64
+                        (prev_total + exit_hold_secs as f64) / stats.trade_count as f64
                     };
 
                     trades.push(BtTrade {
@@ -685,15 +744,15 @@ impl BacktestEngine {
                             "SHORT".to_string()
                         },
                         entry_price: pos.entry_price,
-                        exit_price: close_price,
+                        exit_price: fill_price,
                         size_usd: pos.size_usd,
                         gross_pnl,
                         entry_fee: pos.entry_fee,
                         exit_fee,
                         borrow_fee: pos.accrued_borrow_fee,
                         net_pnl,
-                        hold_secs,
-                        exit_reason: exit_reason.to_string(),
+                        hold_secs: exit_hold_secs,
+                        exit_reason: exit_reason_str.to_string(),
                         entry_time: DateTime::from_timestamp_millis(pos.open_time_ms)
                             .map(|t| t.to_rfc3339())
                             .unwrap_or_default(),
@@ -701,77 +760,65 @@ impl BacktestEngine {
                             .map(|t| t.to_rfc3339())
                             .unwrap_or_default(),
                     });
-
-                    position = None;
-                    continue;
                 }
             }
 
-            // Check entry (only if no position and not in cooldown)
-            if position.is_none() && candle.t >= cooldown_until_ms {
+            // 4) Mark-to-market equity and drawdown — sampled every candle,
+            //    not just at trade close, so unrealized losses are visible.
+            let unrealized = match &position {
+                Some(p) => p.unrealized_pnl_usd() - p.accrued_borrow_fee,
+                None => 0.0,
+            };
+            let mtm_equity = cell_balance + unrealized;
+            equity_curve.push(mtm_equity);
+            if mtm_equity > max_equity {
+                max_equity = mtm_equity;
+            }
+            let dd = max_equity - mtm_equity;
+            if dd > stats.max_drawdown_usd {
+                stats.max_drawdown_usd = dd;
+            }
+
+            // 5) Entry-signal generation. Queue for next-open fill; honor the
+            //    strategy's direction_bias so the backtest matches what the
+            //    live engine would do.
+            if position.is_none()
+                && candle.t >= cooldown_until_ms
+                && pending_entry.is_none()
+            {
                 let entry_signal = strat.detect_entry(&snapshot);
                 match entry_signal {
-                    Signal::MomentumLong { strength, .. } => {
-                        let clip = params.clip_size_usd;
-                        let entry_fee = clip * self.bt_config.fee_rate;
-                        position = Some(BtPosition {
-                            symbol: market.to_string(),
-                            is_long: true,
-                            entry_price: close_price,
-                            current_price: close_price,
-                            peak_price: close_price,
-                            size_usd: clip,
-                            leverage: self.bt_config.leverage,
-                            open_time_ms: candle.t,
-                            entry_fee,
-                            accrued_borrow_fee: 0.0,
-                            borrow_rate_hourly: self.bt_config.borrow_rate_hourly,
-                        });
+                    Signal::MomentumLong { strength, .. } if bias != "short" => {
+                        pending_entry = Some(true);
                         debug!(
-                            "[BT] {} LONG {} @ ${:.2} (strength={:.2})",
+                            "[BT] {} {} LONG signal @ close ${:.4} → queued for next open (strength={:.2})",
                             strategy_name, market, close_price, strength
                         );
                     }
-                    Signal::MomentumShort { strength, .. } => {
-                        let clip = params.clip_size_usd;
-                        let entry_fee = clip * self.bt_config.fee_rate;
-                        position = Some(BtPosition {
-                            symbol: market.to_string(),
-                            is_long: false,
-                            entry_price: close_price,
-                            current_price: close_price,
-                            peak_price: close_price,
-                            size_usd: clip,
-                            leverage: self.bt_config.leverage,
-                            open_time_ms: candle.t,
-                            entry_fee,
-                            accrued_borrow_fee: 0.0,
-                            borrow_rate_hourly: self.bt_config.borrow_rate_hourly,
-                        });
+                    Signal::MomentumShort { strength, .. } if bias != "long" => {
+                        pending_entry = Some(false);
                         debug!(
-                            "[BT] {} SHORT {} @ ${:.2} (strength={:.2})",
+                            "[BT] {} {} SHORT signal @ close ${:.4} → queued for next open (strength={:.2})",
                             strategy_name, market, close_price, strength
                         );
                     }
-                    Signal::NoSignal | Signal::ExitLong { .. } | Signal::ExitShort { .. } => {}
+                    _ => {}
                 }
-            }
-
-            // Update position price even if no exit triggered
-            if let Some(ref mut pos) = position {
-                pos.update_price(close_price, interval_secs);
             }
         }
 
         // Force-close any open position at the last candle's close price
         if let Some(pos) = position.take() {
             let last_price = pos.current_price;
-            let exit_fee = pos.size_usd * self.bt_config.fee_rate;
+            let exit_notional = pos.size_usd * fee_notional_factor;
+            let exit_fee = exit_notional * self.bt_config.fee_rate;
             let gross_pnl = pos.unrealized_pnl_usd();
             let net_pnl = gross_pnl - exit_fee - pos.accrued_borrow_fee;
             let total_fees = pos.entry_fee + exit_fee + pos.accrued_borrow_fee;
 
-            let _ = cell_balance;
+            // No cell_balance/equity_curve update here: this branch runs
+            // after the main loop, so the equity series is already closed
+            // out. Stats below capture the final trade's PnL contribution.
 
             stats.trade_count += 1;
             stats.gross_pnl += gross_pnl;
@@ -780,7 +827,6 @@ impl BacktestEngine {
             stats.exit_fees_total += exit_fee;
             stats.borrow_fees_total += pos.accrued_borrow_fee;
             stats.net_pnl += net_pnl;
-            trade_pnls.push(net_pnl);
 
             if net_pnl >= 0.0 {
                 stats.win_count += 1;
@@ -822,17 +868,37 @@ impl BacktestEngine {
             );
         }
 
-        // Compute final metrics
-        stats.finalize();
-
-        // Sharpe ratio
-        if trade_pnls.len() >= 2 {
-            let mean: f64 = trade_pnls.iter().sum::<f64>() / trade_pnls.len() as f64;
-            let variance: f64 = trade_pnls.iter().map(|p| (p - mean).powi(2)).sum::<f64>()
-                / (trade_pnls.len() - 1) as f64;
-            let std_dev = variance.sqrt();
-            stats.sharpe_ratio = if std_dev > 0.0 { mean / std_dev } else { 0.0 };
+        // Annualized Sharpe ratio computed over per-bar equity returns. This
+        // is the right denominator for the live promotion gate (≥ 1.0): a
+        // per-trade Sharpe on small winners trivially hits 1.0 and means
+        // nothing about risk-adjusted performance.
+        if equity_curve.len() >= 3 {
+            let mut returns: Vec<f64> = Vec::with_capacity(equity_curve.len() - 1);
+            for w in equity_curve.windows(2) {
+                let prev = w[0];
+                let curr = w[1];
+                if prev > 0.0 {
+                    returns.push((curr - prev) / prev);
+                }
+            }
+            if returns.len() >= 2 {
+                let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+                let variance = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>()
+                    / (returns.len() - 1) as f64;
+                let std_dev = variance.sqrt();
+                // Bars/year = seconds/year ÷ bar duration. Annualization
+                // factor on Sharpe is sqrt(N_bars_per_year).
+                let bars_per_year = 365.25 * 86_400.0 / interval_secs;
+                stats.sharpe_ratio = if std_dev > 0.0 {
+                    (mean / std_dev) * bars_per_year.sqrt()
+                } else {
+                    0.0
+                };
+            }
         }
+
+        // Compute final metrics (win_rate, fee_ratio, sharpe_pass).
+        stats.finalize();
 
         Ok((stats, trades))
     }
@@ -891,12 +957,68 @@ impl BacktestEngine {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Check whether a candle's OHLC range crossed TP or SL levels for an open
+/// position. Returns the resolved exit (reason + fill price) if any.
+///
+/// When both TP and SL would have been touched in the same candle, SL is
+/// assumed to fill first — the conservative worst-case for a backtest, and
+/// the only honest assumption without tick data.
+fn intra_candle_tp_sl_hit(
+    is_long: bool,
+    entry_price: f64,
+    tp_pct: f64,
+    sl_pct: f64,
+    low: f64,
+    high: f64,
+) -> Option<(ExitReason, f64)> {
+    if entry_price <= 0.0 || low <= 0.0 || high <= 0.0 {
+        return None;
+    }
+    let (tp_price, sl_price) = if is_long {
+        (
+            entry_price * (1.0 + tp_pct / 100.0),
+            entry_price * (1.0 - sl_pct / 100.0),
+        )
+    } else {
+        (
+            entry_price * (1.0 - tp_pct / 100.0),
+            entry_price * (1.0 + sl_pct / 100.0),
+        )
+    };
+    let tp_hit = tp_pct > 0.0
+        && if is_long {
+            high >= tp_price
+        } else {
+            low <= tp_price
+        };
+    let sl_hit = sl_pct > 0.0
+        && if is_long {
+            low <= sl_price
+        } else {
+            high >= sl_price
+        };
+
+    match (tp_hit, sl_hit) {
+        (false, false) => None,
+        (true, false) => Some((ExitReason::TakeProfit, tp_price)),
+        (false, true) => Some((ExitReason::StopLoss, sl_price)),
+        // Both hit in the same candle: assume SL fills first (worst case).
+        (true, true) => Some((ExitReason::StopLoss, sl_price)),
+    }
+}
+
 /// Map a strategy name to its blueprint source path (for data-driven strategies).
 /// Returns an empty string for built-in strategies.
 fn strategy_source_path(name: &str) -> String {
     match name {
         "blueprint-scalper" => "data/blueprints/cluster-001.json".to_string(),
         "blueprint-mean-revert" => "data/blueprints/cluster-004.json".to_string(),
+        s if s.starts_with("blueprint-cluster-") => {
+            format!(
+                "data/blueprints/{}.json",
+                s.strip_prefix("blueprint-").unwrap()
+            )
+        }
         _ => String::new(), // Built-in strategies have no blueprint source
     }
 }

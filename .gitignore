@@ -5,6 +5,10 @@
 .ruff_cache
 *.json
 !.gitignore
+__pycache__/
+
+# Tool indexes (codegraph MCP)
+.codegraph/
 
 # Local environment overrides
 .env

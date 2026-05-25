@@ -1,6 +1,11 @@
 [agent]
-# Polling interval for price/engine ticks. Affects borrow fee accrual (BUG-001 fix).
-poll_interval_secs = 300
+# Polling interval for price/engine ticks. Drives sampling resolution for
+# the momentum/mean-reversion detectors — at 60s, a `lookback_count` of 60
+# spans one hour of context, which fits the "scalping in minutes" intent
+# of the built-in strategies. Lower this only if Flash RPC quotas allow;
+# higher values blunt the entry/exit detectors and increase borrow fees per
+# tick.
+poll_interval_secs = 60
 log_level = "info"
 
 [flash]
@@ -211,6 +216,76 @@ trailing_activation_pct = 0.0
 # Direction bias from cluster data (mixed = trade both directions)
 # Source: cluster-004 direction = "mixed"
 direction_bias = "neutral"
+scale_in_clips = 1
+cooldown_after_loss_secs = 300
+use_native_tp_sl = true
+leverage = 3.0
+
+
+
+
+# =============================================================================
+# AUTO-GENERATED BLUEPRINT STRATEGIES (2026-05-25T18:47:51Z)
+# Data lineage: fills -> clusters -> medians -> blueprint -> config
+# DO NOT EDIT MANUALLY — re-run inject_blueprints.py to regenerate
+# =============================================================================
+
+# Data-Driven Strategy from cluster-002
+# Source: data/blueprints/cluster-002.json
+# 8 wallets, 1551 trades, confidence 0.81
+# Market: AERO, Direction: mixed, Type: trend_follower -> trend-follower
+[strategy.blueprint-cluster-002]
+breakout_threshold_pct = 0.4661
+confirmation_ticks = 4
+min_price_count = 30
+clip_size_usd = 154.96
+take_profit_pct = 0.4661
+stop_loss_pct = 0.3776
+max_hold_secs = 8557
+trailing_stop_pct = 0.1864
+trailing_activation_pct = 0.2797
+direction_bias = "neutral"
+scale_in_clips = 1
+cooldown_after_loss_secs = 300
+use_native_tp_sl = true
+leverage = 3.0
+
+# Data-Driven Strategy from cluster-003
+# Source: data/blueprints/cluster-003.json
+# 6 wallets, 1038 trades, confidence 0.79
+# Market: HYPE, Direction: mixed, Type: mean_reversion -> mean-reversion
+[strategy.blueprint-cluster-003]
+mean_lookback = 30
+deviation_threshold_pct = 0.3483
+reversal_confirmation_ticks = 2
+mean_tolerance_pct = 0.3
+clip_size_usd = 322.93
+take_profit_pct = 0.3483
+stop_loss_pct = 0.2520
+max_hold_secs = 1600
+trailing_stop_pct = 0.0000
+trailing_activation_pct = 0.0000
+direction_bias = "neutral"
+scale_in_clips = 1
+cooldown_after_loss_secs = 300
+use_native_tp_sl = true
+leverage = 3.0
+
+# Data-Driven Strategy from cluster-005
+# Source: data/blueprints/cluster-005.json
+# 6 wallets, 555 trades, confidence 0.80
+# Market: BTC, Direction: long, Type: trend_follower -> trend-follower
+[strategy.blueprint-cluster-005]
+breakout_threshold_pct = 1.9196
+confirmation_ticks = 4
+min_price_count = 30
+clip_size_usd = 197.42
+take_profit_pct = 1.9196
+stop_loss_pct = 1.5553
+max_hold_secs = 31626
+trailing_stop_pct = 0.7678
+trailing_activation_pct = 1.1518
+direction_bias = "long"
 scale_in_clips = 1
 cooldown_after_loss_secs = 300
 use_native_tp_sl = true

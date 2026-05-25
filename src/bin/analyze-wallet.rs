@@ -450,6 +450,16 @@ async fn post_json<T: serde::de::DeserializeOwned>(
                             last_err = Some(anyhow::anyhow!("Read body error: {}", e));
                         }
                     }
+                } else if status.as_u16() == 429 {
+                    let backoff = RETRY_BASE_DELAY_SECS * 2u64.pow(attempt - 1);
+                    warn!(
+                        url,
+                        attempt,
+                        backoff_secs = backoff,
+                        "Rate limited (429) on POST, backing off"
+                    );
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    last_err = Some(anyhow::anyhow!("HTTP 429: {}", url));
                 } else {
                     last_err = Some(anyhow::anyhow!("HTTP {} from {}", status, url));
                 }
@@ -1840,6 +1850,18 @@ async fn main() -> Result<()> {
             Ok(d) => d,
             Err(e) => {
                 error!(address = %wallet.address, error = %e, "Failed to fetch wallet data");
+
+                // If we got rate limited, sleep longer before the next wallet to let the rate limit window clear
+                let err_str = e.to_string();
+                if err_str.contains("429") || err_str.contains("Too Many Requests") {
+                    let cooldown = 5;
+                    warn!(
+                        "Rate limit detected (429). Sleeping for {} seconds to cool down...",
+                        cooldown
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(cooldown)).await;
+                }
+
                 // Create empty report
                 let report = WalletReport {
                     address: wallet.address.clone(),
